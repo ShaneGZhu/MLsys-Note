@@ -1,0 +1,16 @@
+# 忽略编译产物（可执行文件）
+# 无扩展名的二进制/可执行文件
+CUDA-Learn/cg_demo
+
+# 通用编译产物
+*.o
+*.a
+*.so
+*.out
+*.exe
+*.elf
+
+# CUDA 编译产物
+*.fatbin
+*.cubin
+*.ptx
