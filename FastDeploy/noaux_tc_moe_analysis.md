@@ -10,6 +10,7 @@
 2. [noaux_tc 算法原理](#2-noaux_tc-算法原理)
    - [topk_group 的作用](#topk_group-的作用)
 3. [CUDA Kernel 实现](#3-cuda-kernel-实现)
+   - [warp_topk 工具库速查](#warptopk-工具库速查noauxtc_kernelh46)
 4. [Python 层调用链路](#4-python-层调用链路)
 5. [各后端完整调用链路](#5-各后端完整调用链路)
    - [5.1 Cutlass 后端（w16a16）](#51-cutlass-后端w16a16)
@@ -313,6 +314,90 @@ int select = xorwow_moe(state) % len;               // xorwow 伪随机（以 to
 int selected_rank = expert_id_to_ep_rank_array[expert_topk * redundant_ep_rank_num_plus_one + select];
 atomicAdd(&tokens_per_expert_stats_list[expert_topk], 1);  // 负载统计
 topk_indices[i] = selected_rank;  // 输出 EP rank id，而非 expert id
+```
+
+### warp_topk 工具库速查（`noauxtc_kernel.h:46`）
+
+> 开发 `topk_with_k2_kernel` 和 `group_idx_and_topk_idx_kernel` 时的工具参考。
+
+#### 工具函数
+
+| 函数 | 签名 | 用途 |
+|---|---|---|
+| `round_up_to_multiple_of<N>(len)` | `__host__ __device__ constexpr T` | 对 N 向上取整，用于循环边界对齐到 WARP_SIZE |
+| `calc_smem_size_for_block_wide<T,idxT>(num_warps, k)` | `int` | 计算 `WarpSelect` 需要的动态 smem 字节数，传给 kernel 启动参数 |
+| `isPowerOf2(v)` | `constexpr bool` | 编译期检查 2 的幂次（`WarpSelect capacity` 约束） |
+| `neg_inf<T>()` | `__device__ T` | 返回类型 T 的负无穷（via float cast，bf16/fp16 安全） |
+
+#### WarpSelect — 核心 top-k 选择器
+
+```cpp
+// 模板参数
+WarpSelect<
+    int capacity,      // 内部缓存大小，必须是 2^n 且 >= 32（WARP_SIZE）
+                       // topk <= capacity；两个 kernel 均用 capacity=WARP_SIZE=32
+    bool greater,      // true=选最大 top-k，false=选最小
+    typename T,        // 分数类型（float / __nv_bfloat16）
+    typename idxT,     // 索引类型（int32_t）
+    bool is_stable     // true=相同分数时用 smaller index 打破平局
+>
+```
+
+**构造**
+
+```cpp
+WarpSelect<WARP_SIZE, true, T, int32_t, true> queue(
+    (int32_t)topk,   // k：最终保留前 k 个
+    neg_inf<T>()     // dummy：初始填充值，选最大时用负无穷
+);
+```
+
+**API 调用顺序（必须严格遵守）**
+
+```
+1. queue.add(val, idx)      // 可调用任意多次，每次添加一个候选
+   或
+   queue.add(in_ptr, start, end)  // 批量添加 [start, end) 范围
+                                  // 内部自动对齐到 WARP_SIZE 边界
+
+2. queue.done()             // 必须调用！内含 __syncthreads()
+                            //   → 整个 block 所有 warp 必须都走到此处
+                            //   → done() 之后 smem 被 WarpSelect 用于 warp 间归并
+                            //   → 不要在 done() 后、dump 前向 smem 写其他数据
+
+3. queue.dumpIdx(out_idx)   // 只导出索引（两个 kernel 实际用法）
+   或
+   queue.dump(out, out_idx) // 同时导出值和索引
+```
+
+**约束汇总**
+
+| 约束 | 说明 |
+|---|---|
+| `capacity` 必须是 2 的幂次且 ≥ 32 | static_assert 保证，编译期报错 |
+| `topk ≤ capacity` | 两个 kernel 均用 `capacity=WARP_SIZE=32`，故 `topk ≤ 32` |
+| `done()` 含 `__syncthreads()` | block 内所有 warp 必须无条件走到 `done()`，用 `if_proceed_next_topk` 保护 `add()` 但不能保护 `done()` |
+| `add()` 的 idx 是全局 expert 编号 | `dumpIdx` 导出的也是全局编号，可直接作为 `scores[]` 下标 |
+| smem 复用时序 | `group_idx_and_topk_idx_kernel` 里 `s_topk_idx` / `s_topk_value` 与 `WarpSelect` 共用同一块 `smem_buf`；`WarpSelect` 在 `done()` 后才使用 smem，因此 `dumpIdx` 写完 `s_topk_idx` 之后才能继续使用 |
+
+#### BitonicSort / BitonicMerge — 内部排序（不直接调用）
+
+`WarpSelect` 的内部实现，开发者**无需直接调用**。只需知道：
+- warp 内双调排序，寄存器级别，无需额外 smem
+- `capacity=32` 时退化为纯 warp shuffle 实现（`BitonicSort<32,...>`）
+
+#### smem 布局示意（`group_idx_and_topk_idx_kernel`）
+
+```
+smem_buf  [0 ...]
+│
+├── WarpSelect 内部区域（val_smem_ / idx_smem_）
+│     由 WarpSelect 构造函数自动计算偏移，大小 = calc_smem_size_for_block_wide(NUM_WARPS_PER_BLOCK, topk)
+│
+└── 额外区域（kernel 手动管理，与 WarpSelect smem 复用，时序安全）
+      s_topk_idx   [NUM_WARPS_PER_BLOCK * topk]  int32_t
+      s_topk_value [warp_id * topk ... (warp_id+1)*topk]  T
+                                   ↑ 每个 warp 独立一段，避免竞争
 ```
 
 ---
