@@ -16,162 +16,42 @@
 
 ---
 
-## 问题清单与优化方案
+## 代码复核结论
 
-### P0（已复核）：`topk_with_k2_kernel` 内嵌调用分析
-
-**代码位置**：L528-535
-
-```cpp
-topk_with_k2_kernel(
-    group_scores, scores_with_bias,
-    num_tokens, n_group, num_experts, num_experts_per_group
-);
-// 调用返回后，主 kernel 再做自己的指针偏移
-scores_with_bias += case_id * num_experts;
-group_scores     += case_id * n_group;
-```
+### `topk_with_k2_kernel` 内嵌调用（L528-535）
 
 **结论：无冗余计算，无竞争写，逻辑正确。**
 
-原因分析：
-- `topk_with_k2_kernel` 是 `__device__` 函数，参数为**值传递**，函数内部 `input += offset` / `output += offset` 只修改局部栈上的指针副本，不影响调用方的 `group_scores` / `scores_with_bias` 变量
-- 函数内部 `token_id = blockIdx.x * NUM_WARPS_PER_BLOCK + warp_id`，继承主 kernel 的上下文，每个 warp 只负责自己的 token，不存在多 warp 写同一位置的竞争
-- 主 kernel 调用返回后，`group_scores` 仍指向全局基址，L538 的偏移从基址出发，完全正确
-- `cg::tiled_partition<32>` 的 tile 只覆盖当前 warp 的 32 个线程，不控制跨 warp
+- `topk_with_k2_kernel` 是 `__device__` 函数，参数**值传递**，内部指针偏移不影响调用方变量
+- `token_id = blockIdx.x * NUM_WARPS_PER_BLOCK + warp_id`，每个 warp 只写自己的 token，无竞争
+- `cg::tiled_partition<32>` 的 tile 只覆盖当前 warp 的 32 个线程
 
-**潜在关注点（非 bug）**：
-- 注释掉的 2-kernel 方案（L889-918）原本想将 group score 计算独立出去，当前折叠进主 kernel 是一种设计选择，节省了一次 kernel launch 开销
-- SM90 以下无 `griddepcontrol`，同一 warp 内 device 函数调用本身是串行的，读写顺序有保证，无需额外同步
+### Shared Memory Bank Conflict（L544-553）
 
----
+**结论：无 bank conflict 问题。**
 
-### P1：算术与分支优化
-
-#### 问题 2：`routed_scaling_factor` 使用 `double` 传参
-
-**代码位置**：L520, L663-666
-
-```cpp
-double routed_scaling_factor   // 函数参数
-
-// 实际运算
-value = cuda_cast<float, T>(s_topk_value[i]) / topk_sum * routed_scaling_factor;
-```
-
-**问题分析**：
-- GPU 上 double 算术吞吐比 float 低 8-32x（视架构）
-- 实际精度需求为 float 级别，`double` 参数只是被隐式转换使用
-
-**优化方案**：将参数类型改为 `float`
+- WarpSelect 阶段：`warp_id * WARP_SIZE + lane_id`，32 lane 访问 32 个连续元素，完美覆盖 32 个 bank
+- `s_topk_idx/s_topk_value` 阶段：同一 warp 内连续访问，无 conflict；不同 warp 间访问时间独立，bank conflict 概念不适用
 
 ---
 
-#### 问题 3：`renormalize` 运行时分支未特化
+## 优化方案
 
-**代码位置**：L662-667
+### P1-A：`n_group` 模板特化 + Dispatch
 
-```cpp
-if (renormalize) {
-    value = ... / topk_sum * routed_scaling_factor;
-} else {
-    value = ... * routed_scaling_factor;
-}
-```
-
-**问题分析**：
-- `renormalize` 在实际推理中几乎是常量，每次 kernel 调用值固定
-- 造成 warp-level 的条件判断开销
-
-**优化方案**：将 `renormalize` 提升为模板参数
-
-```cpp
-template <typename T, typename IdxT, bool kRenormalize>
-__global__ void group_idx_and_topk_idx_kernel(...) {
-    ...
-    if constexpr (kRenormalize) {
-        value = ... / topk_sum * routed_scaling_factor;
-    } else {
-        value = ... * routed_scaling_factor;
-    }
-}
-```
-
----
-
-### P2：内存访问优化
-
-#### 问题 4：Shared Memory Bank Conflict（已复核：无问题）
-
-**代码位置**：L544-553
-
-smem 分两个阶段复用：
-
-**阶段一 WarpSelect**（L596~L625）：
-- `val_smem_[warp_id * WARP_SIZE + lane_id]`，32 lane 访问 32 个连续 int32，正好覆盖 32 个 bank，无 conflict
-
-**阶段二 s_topk_idx/s_topk_value**（L625之后）：
-- 同一 warp 内 lane 访问 `s_topk_idx[warp_id*topk + lane_id]`，是连续地址，无 conflict
-- **不同 warp 之间不存在 bank conflict 概念**（各 warp 执行时间独立，bank conflict 只发生在同一 warp 内部的不同 lane 同时访问同一 bank 时）
-
-**结论：当前代码无 bank conflict 问题，此条优化项取消。**
-
----
-
-#### 问题 5：`scores` 数组清零开销（已评估，不采纳）
-
-**代码位置**：L651-655
-
-**评估结论**：优化方向（收窄清零范围、下沉到 caller）均存在以下问题：
-- 收窄清零范围需要跟踪 group 选中状态，代码改动分散、可读性下降
-- 省略清零需要确认 `moe_expert_dispatch` C++ 实现不读未写位置，链路较长、风险难以控制
-- 性价比不足，**不采纳**
-
----
-
-#### 问题 6：`isfinite` 检查有隐式转换
-
-**代码位置**：L614
-
-```cpp
-isfinite(cuda_cast<float, T>(scores_with_bias[offset + i]))
-```
-
-**优化方案**：
-- 对 `T=__nv_bfloat16`，直接用位操作判断 exponent 全1：
-  ```cpp
-  // bfloat16: sign(1) + exp(8) + mantissa(7)
-  // inf/nan 判断：exp 全1 即 0x7F80
-  inline __device__ bool is_finite_bf16(__nv_bfloat16 val) {
-      return (__bfloat16_as_ushort(val) & 0x7F80) != 0x7F80;
-  }
-  ```
-
----
-
-### P1：`n_group` 模板特化 + `invokeNoAuxTc` Dispatch
-
-#### 现状
+#### 现状问题
 
 **代码位置**：L529
 
 ```cpp
-T group_scores_tmp[8];  // 硬编码为 8，n_group=1 时浪费寄存器，n_group>8 时越界
-topk_with_k2_kernel(group_scores_tmp, ...);
-group_scores = group_scores_tmp;
+T group_scores_tmp[8];  // 硬编码为 8：n_group=1 时浪费寄存器，n_group>8 时越界
 ```
 
-已经用了寄存器数组的思路，但 `[8]` 是硬编码，存在两个问题：
-- `n_group=1`（GLM-4.5-Air）时多占 7 个寄存器
-- 未来 `n_group=16` 的模型会直接越界
-
-#### `n_group` 的取值特性（已确认）
+#### `n_group` 取值特性（已确认）
 
 - 来源：模型 `config.json`，启动时一次性加载，**运行时不会动态修改**
 - 当前已知取值：`1`（GLM-4.5-Air）、`8`（DeepSeek-V3/R1）
-- 语义约束：`n_group` 必须整除 `num_experts`，实践中均为 2 的幂次
-
-因此可以安全地将 `n_group` 提升为编译期模板参数。
+- 实践中均为 2 的幂次，可安全做模板特化
 
 #### 方案设计
 
@@ -203,7 +83,7 @@ __global__ void group_idx_and_topk_idx_kernel(
 
   scores_with_bias += case_id * num_experts;
   scores           += case_id * num_experts;
-  group_scores      = group_scores_tmp;   // 重定向到寄存器数组
+  group_scores      = group_scores_tmp;
 
   // 后续所有 n_group 替换为 kNGroup（编译器静态折叠）
   int32_t want_neg_inf_num = WARP_SIZE - kNGroup + topk_group;
@@ -241,7 +121,6 @@ void invokeNoAuxTc(..., int64_t const n_group, ...) {
                            NUM_WARPS_PER_BLOCK, topk);
 
 #ifdef PADDLE_WITH_CUSTOM_DEVICE_METAX_GPU
-  // METAX 路径：直接 <<<>>> 调用
   DISPATCH_NGROUP_KERNEL(
       group_idx_and_topk_idx_kernel, T, IdxT, n_group,
       num_blocks, BLOCK_SIZE, smem_bytes, stream,
@@ -249,7 +128,6 @@ void invokeNoAuxTc(..., int64_t const n_group, ...) {
       num_tokens, topk_group, topk, num_experts, num_experts / n_group,
       renormalize, routed_scaling_factor);
 #else
-  // NVIDIA 路径：cudaLaunchKernelEx，需要函数指针，用 lambda 封装
   auto launch = [&](auto* kernel_ptr) {
     cudaLaunchConfig_t config;
     cudaLaunchAttribute attrs[1];
@@ -278,68 +156,112 @@ void invokeNoAuxTc(..., int64_t const n_group, ...) {
 }
 ```
 
-#### 编译产物与预期收益
+#### 预期收益
 
-| kNGroup | 适用模型 | group_scores_tmp 寄存器 | 额外收益 |
-|---------|---------|------------------------|---------|
-| 1 | GLM-4.5-Air | 1 个 | 分组循环完全消除，编译器折叠为 if/直通 |
-| 8 | DeepSeek-V3/R1 | 8 个 | 8 次全局内存广播读 → 寄存器；循环被 unroll |
-| 2/4/16 | 未来模型预备 | 2/4/16 个 | 同上 |
+| kNGroup | 适用模型 | 收益 |
+|---------|---------|------|
+| 1 | GLM-4.5-Air | 分组循环完全消除，寄存器精确为 1 个 |
+| 8 | DeepSeek-V3/R1 | 循环 unroll，寄存器精确为 8 个 |
+| 2/4/16 | 未来模型 | 同上，防止越界 |
 
-`topk_with_k2_kernel` 内部的 `for (loc_group_idx < kNGroup)` 循环在编译期常量下被 `#pragma unroll` 完全展开，循环控制开销也消除。
+`topk_with_k2_kernel` 内部 `for (loc_group_idx < kNGroup)` 循环在编译期常量下被完全展开。
 
-#### `group_scores` 参数的处理
+#### 注意事项
 
-- `group_idx_and_topk_idx_kernel`：保留参数但内部不再使用（加 `[[maybe_unused]]` 注释），保持 caller 接口不变
+- `group_idx_and_topk_idx_kernel`：`group_scores` 参数保留（加 `[[maybe_unused]]`），保持 caller 接口不变
 - `group_idx_and_topk_idx_redundant_kernel`：不受影响，仍从外部接收 `group_scores`
 
 ---
 
-### P3：`topk_sum` 累加逻辑检查
+### P1-B：`routed_scaling_factor` double → float
 
-**代码位置**：L634-646
+**代码位置**：L522, L668-671
 
 ```cpp
-float topk_sum = 1e-20;
-for (int i = lane_id; i < round_up_to_multiple_of<WARP_SIZE>(topk); i += WARP_SIZE) {
-    T value = i < topk ? scores[s_topk_idx[i]] : 0.0f;
-    ...
-    topk_sum += cg::reduce(tile, cuda_cast<float, T>(value), cg::plus<float>());
+double routed_scaling_factor   // 当前：double 参数
+// 实际只做 float 精度的乘法运算
+value = cuda_cast<float, T>(s_topk_value[i]) / topk_sum * routed_scaling_factor;
+```
+
+GPU 上 double 算术吞吐比 float 低 8-32x，精度需求为 float 级别。
+
+**方案**：将 kernel 参数类型改为 `float`（`invokeNoAuxTc` 的调用方已经传 `float`）
+
+---
+
+### P1-C：`renormalize` 模板特化
+
+**代码位置**：L667-672
+
+```cpp
+if (renormalize) {          // 运行时分支，值固定但每次执行都判断
+    value = ... / topk_sum * routed_scaling_factor;
+} else {
+    value = ... * routed_scaling_factor;
 }
 ```
 
-**问题分析**：
-- `cg::reduce` 返回 warp-level 求和，每个 lane 都加完整 reduce 结果 → 单轮（`topk <= 32`）时各 lane 的 `topk_sum` 相同，结果正确
-- 若 scores 中含负值（理论上不应该，但异常输入时），`topk_sum` 可能 < `1e-20`，renormalize 结果异常放大
+`renormalize` 在推理中为常量，可提升为模板参数消除运行时分支：
 
-**优化方案**：renormalize 前增加守卫：
+```cpp
+template <typename T, typename IdxT, int kNGroup, bool kRenormalize>
+__global__ void group_idx_and_topk_idx_kernel(...) {
+    if constexpr (kRenormalize) {
+        value = ... / topk_sum * routed_scaling_factor;
+    } else {
+        value = ... * routed_scaling_factor;
+    }
+}
+```
+
+dispatch 宏在 P1-A 基础上再加一层 `renormalize` 的 bool 特化（2×5=10 个特化版本）。
+
+---
+
+### P3-A：`topk_sum` 负值防护
+
+**代码位置**：L639, L668
+
+`topk_sum` 初始化为 `1e-20` 用于防除零，但若 scores 出现负值（异常输入），`topk_sum` 可能仍小于 `1e-20`。
+
+**方案**：renormalize 前加一行守卫
+
 ```cpp
 topk_sum = max(topk_sum, 1e-20f);
 ```
 
 ---
 
-## 优化优先级汇总
+### P3-B：`isfinite` 位操作替代
 
-| 优先级 | 问题 | 预期收益 | 难度 |
-|--------|------|---------|------|
-| **P1** | `n_group` 模板特化 + dispatch（1/2/4/8/16） | 寄存器精确分配 + 循环 unroll + 消除全局内存读 | 中 |
-| **P1** | `routed_scaling_factor` double→float | 算术吞吐提升 | 低 |
-| **P1** | `renormalize` 模板特化 | 消除分支 | 低 |
-| ~~P2~~ | ~~smem bank conflict padding~~ | ~~已复核：无 bank conflict，此项取消~~ | - |
-| ~~P2~~ | ~~scores 清零优化~~ | ~~已评估：风险高、可读性下降，不采纳~~ | - |
-| **P3** | `isfinite` 位操作替代 | 小幅 | 低 |
-| **P3** | `topk_sum` 防护 | 鲁棒性 | 低 |
+**代码位置**：L614, L619
+
+```cpp
+isfinite(cuda_cast<float, T>(scores_with_bias[offset + i]))  // 每次隐式转换 bf16→float
+```
+
+对 `T=__nv_bfloat16` 可直接用位操作判断，避免转换：
+
+```cpp
+inline __device__ bool is_finite_bf16(__nv_bfloat16 val) {
+    // bfloat16: sign(1) + exp(8) + mantissa(7)，exp 全1 即 inf/nan
+    return (__bfloat16_as_ushort(val) & 0x7F80) != 0x7F80;
+}
+```
 
 ---
 
-## 待讨论事项
+## 优化优先级汇总
 
-- [x] `n_group` 动态性确认：与 model config 绑定，运行时不变，可安全做模板特化
-- [x] P0 `topk_with_k2_kernel` 冗余调用：已复核，逻辑正确，指针值传递，无竞争写，无冗余计算
-- [ ] P0 拆分方案：是用 2-kernel + stream dependency，还是用 `cudaLaunchKernelEx` programmatic serialization？
-- [ ] smem 生命周期分析：WarpSelect 和 `s_topk_idx/s_topk_value` 是否真的可以复用同一块 smem？
-- [ ] `scores` 清零是否可以下沉到 caller 侧？
+| 优先级 | 方案 | 预期收益 | 实现难度 |
+|--------|------|---------|---------|
+| **P1** | P1-A：`n_group` 模板特化 + dispatch | 寄存器精确分配 + 循环 unroll + 防越界 | 中 |
+| **P1** | P1-B：`routed_scaling_factor` double→float | 算术吞吐提升 | 低 |
+| **P1** | P1-C：`renormalize` 模板特化 | 消除运行时分支 | 低 |
+| **P3** | P3-A：`topk_sum` 负值防护 | 鲁棒性提升 | 低 |
+| **P3** | P3-B：`isfinite` 位操作替代 | 小幅性能提升 | 低 |
+
+P1-A/B/C 可捆绑为一个 PR，P3 单独处理。
 
 ---
 
