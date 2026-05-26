@@ -888,3 +888,534 @@ Forward Pass (per layer):
 │    └─ 压缩: flash_mla(..., extra_k_cache, extra_indices) │
 └──────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 8. Compress State Ring Buffer 机制
+
+### 8.1 State Pool 的作用
+
+c4/c128 层在压缩时需要凑够 `compress_ratio` 个 token 才能输出一个 compressed KV。在此之前，已到达但尚未凑齐的 token 的中间状态需要暂存——这就是 **State Ring Buffer** 的职责。
+
+关键文件：
+- `python/sglang/srt/mem_cache/deepseek_v4_compress_state.py` — `CompressStatePool` 定义
+- `python/sglang/srt/layers/attention/dsv4/compressor.py` — `Compressor` 类（wkv_gate 投影 + 压缩调度）
+- `python/sglang/srt/layers/attention/dsv4/compressor_v2.py` — V2 压缩路径（JIT C++ kernel）
+- `python/sglang/jit_kernel/csrc/deepseek_v4/c4_v2.cuh` — c4 CUDA 压缩 kernel
+- `python/sglang/jit_kernel/csrc/deepseek_v4/c128_v2.cuh` — c128 CUDA 压缩 kernel
+- `python/sglang/jit_kernel/csrc/deepseek_v4/c128_online_v2.cuh` — c128 在线压缩 kernel
+
+### 8.2 kv 和 score 的计算来源
+
+每个 token 的 state 由 **`wkv_gate` 线性投影** 产生：
+
+```python
+# compressor.py:317-320
+self.wkv_gate = ReplicatedLinear(
+    self.dim,                    # 输入: hidden_size (7168)
+    2 * coff * self.head_dim,    # 输出: 2 × coff × head_dim
+    bias=False,
+)
+
+# compressor.py:353-354
+def compute_kv_score(self, x, forward_batch):
+    kv_score = linear_bf16_fp32(x, self.wkv_gate.weight)  # [num_tokens, 2*coff*head_dim]
+    return kv_score
+```
+
+其中 `coff = 1 + overlap`：c4 层 overlap=True → coff=2；c128 层 overlap=False → coff=1。
+
+**输出维度拆解**（以 c4 为例, head_dim=512）：
+
+```
+wkv_gate 输出: [num_tokens, 2 × 2 × 512] = [num_tokens, 2048]
+                           ├── kv 部分 (前 1024): coff × head_dim — token 的「内容表示」
+                           └── score 部分 (后 1024): coff × head_dim — token 的「重要性权重」
+```
+
+语义对比：
+
+| 分量 | 维度 | 含义 |
+|------|------|------|
+| **kv** | coff × head_dim | 该 token 对压缩 KV 的**内容贡献**（"我携带什么信息"） |
+| **score** | coff × head_dim | 该 token 对压缩 KV 的**权重贡献**（"我有多重要"） |
+
+### 8.3 压缩公式：加权 softmax 求和
+
+凑够 `ratio` 个 token 后执行压缩：
+
+```python
+# 核心公式 (compressor 内部)
+# kv_and_score_to_compress: [num_windows, ratio, head_dim]
+
+# 1. 加上可学习的位置偏置 (APE)
+kv_and_score_to_compress.score.add_(self.ape.unsqueeze(0))
+
+# 2. softmax 加权求和
+kv_compressed = (
+    kv_and_score_to_compress.kv                     # [windows, ratio, head_dim]
+    * kv_and_score_to_compress.score.softmax(dim=1)  # softmax over ratio 维度
+).sum(dim=1)                                         # → [windows, head_dim]
+```
+
+数学表达：
+
+$$\text{compressed\_kv} = \sum_{i=0}^{\text{ratio}-1} \text{softmax}(\text{score} + \text{APE})_i \cdot \text{kv}_i$$
+
+- `APE`（Absolute Position Encoding）：可学习参数 `[ratio, coff × head_dim]`，为窗口内不同位置提供位置偏置
+- softmax 使得压缩是**内容自适应**的——重要 token 贡献更大权重
+
+压缩完成后：`compressed_kv` 经过 `RMSNorm → RoPE → 存入 c4/c128 KV pool`。
+
+### 8.4 完整数据流
+
+```
+hidden_state x  [num_tokens, 7168]
+     │
+     ▼ wkv_gate (Linear: 7168 → 2048)
+     │
+     ├─────────────────────────────────┐
+     ▼                                 ▼
+   kv (1024 dim)                   score (1024 dim)
+  "内容表示"                        "重要性权重"
+     │                                 │
+     ▼───── 写入 State Ring Buffer ────▼
+     │       (等待凑够 ratio=4 个)       │
+     │                                 │
+     │  ┌──── 凑够 4 个 token ─────┐   │
+     │  ▼                           ▼   │
+     │  kv[0..3]               score[0..3]
+     │     │                        │
+     │     │                        ▼ + APE (位置偏置)
+     │     │                        │
+     │     │                        ▼ softmax(dim=ratio)
+     │     │                     weights[0..3]
+     │     │                        │
+     │     ▼──── 加权求和 ──────────┘
+     │
+     ▼
+compressed_kv [1, 512]
+     │
+     ▼ RMSNorm + RoPE
+     │
+     ▼ 存入 c4_kv_pool (持久化)
+```
+
+### 8.5 Ring Buffer 物理布局
+
+**索引公式**（`deepseek_v4_compress_state.py:135`）：
+
+```python
+def translate_from_swa_loc_to_state_loc(self, swa_loc: torch.Tensor) -> torch.Tensor:
+    swa_pages = swa_loc // self.swa_page_size      # 属于哪个 SWA page
+    state_loc = swa_pages * self.ring_size + (swa_loc % self.ring_size)
+    state_loc = torch.where(swa_loc < 0, -1, state_loc)
+    return state_loc
+```
+
+**Ring size 选择**（`deepseek_v4_memory_pool.py:30-43`）：
+
+```python
+def get_compress_state_ring_size(compress_ratio: int, is_speculative: bool = False) -> int:
+    if compress_ratio == 128 and ONLINE_C128:
+        return 1   # 在线模式只需 1 个 slot
+    if is_speculative:
+        return 16 if compress_ratio == 4 else 256
+    else:
+        return 8 if compress_ratio == 4 else 128
+```
+
+| | c4 | c128 | c128 (在线) |
+|---|---|---|---|
+| compress_ratio | 4 | 128 | 128 |
+| ring_size (正常) | 8 | 128 | 1 |
+| ring_size (投机) | 16 | 256 | — |
+| ring / compress_ratio | 2 (有 overlap) | 1 | 1/128 |
+
+**每层的物理 tensor**：
+
+```
+c4_state_pool per layer:  [num_swa_pages × 8, 2048]   (FP32)
+c128_state_pool per layer: [num_swa_pages × 128, 1024] (FP32)
+c128_online per layer:     [num_swa_pages × 1, 1536]   (FP32)
+```
+
+每个 state slot 的 last_dim 拆解：
+
+| 模式 | last_dim | 公式 | 布局 |
+|------|----------|------|------|
+| c4 (overlap) | 2048 | `2×(1+1)×512` | `[kv_overlap \| kv_current \| score_overlap \| score_current]` |
+| c128 (非在线) | 1024 | `2×(1+0)×512` | `[kv \| score]` |
+| c128 (在线) | 1536 | `3×512` | `[max \| sum \| kv]` (online softmax 三元组) |
+
+### 8.6 Ring 在 SWA Page 内的循环覆写
+
+以 c4 `ring_size=8`, `swa_page_size=128` 为例：
+
+```
+SWA page (128 tokens) → 只有 8 个 state slot
+→ ring 在一个 page 内循环 128/8 = 16 圈
+
+swa_loc (页内偏移)  →  swa_loc % 8  →  state slot
+────────────────────────────────────────────────
+0                       0               slot 0
+1                       1               slot 1
+...
+7                       7               slot 7
+8                       0               slot 0  ← 覆写
+...
+127                     7               slot 7
+```
+
+**为什么覆写是安全的**：
+
+- compress_ratio=4：每 4 个 token 完成一次压缩，compressed KV 已存入 c4_kv_pool
+- ring_size=8 = 2 × compress_ratio：同时保留**当前窗口 + 前一窗口** 的数据
+- c4 有 **overlap 机制**——压缩 token[4..7] 时需要读取 token[0..3] 的 kv/score
+- 当 token[8..11] 开始覆写 slot 0-3 时，token[4..7] 的 slot 4-7 仍完好
+
+```
+┌─── 窗口 0 (token 0-3) ───┐┌─── 窗口 1 (token 4-7) ───┐
+│ slot 0  slot 1  slot 2  slot 3 ││ slot 4  slot 5  slot 6  slot 7 │
+└── 压缩完成, 输出 c4[0] ─────┘└── 压缩时读取窗口 0 overlap ──┘
+                                              ↕
+                                  ┌─── 窗口 2 (token 8-11) ──┐
+                                  │ slot 0-3 被覆写 (安全)     │
+                                  │ 窗口 1 的 slot 4-7 仍有效  │
+                                  └───────────────────────────┘
+```
+
+### 8.7 每层的 Ring 数量
+
+每个 SWA page 绑定一个 ring，因此：
+
+```
+num_rings_per_layer = swa_tokens / swa_page_size
+```
+
+Pool sizing 来自 `pool_configurator.py:420-421`：
+
+```python
+c4_state_pool_size = swa_tokens // self.swa_page_size * self.c4_ring_size
+c128_state_pool_size = swa_tokens // self.swa_page_size * self.c128_ring_size
+```
+
+典型数值（full_tokens=100,000, swa_ratio=0.1）：
+
+```
+swa_tokens = 10,000
+num_swa_pages = 10,000 / 128 = 78
+
+每个 c4 层:  78 rings × 8 slots/ring  = 624 state slots
+每个 c128 层: 78 rings × 128 slots/ring = 9,984 state slots
+```
+
+### 8.8 State Ring Buffer 与 Prefix Caching 的适配
+
+#### 核心设计：State 不独立管理，寄生于 SWA 生命周期
+
+```
+┌─────────────────────────────────────────┐
+│  Radix Tree (full-pool indices)         │  ← 持久化层
+│  - 负责 cache 管理、eviction、match      │
+├─────────────────────────────────────────┤
+│  SWA Pool (full_to_swa_mapping)         │  ← 半持久层
+│  - 跟随 tree node 生命周期              │
+│  - tombstone 可独立释放                 │
+├─────────────────────────────────────────┤
+│  State Pool (swa_loc → state_loc)       │  ← 瞬态层
+│  - 完全依附 SWA slot 有效性             │
+│  - 无独立分配/释放 API                  │
+│  - ring 覆写 = 隐式回收                 │
+└─────────────────────────────────────────┘
+```
+
+#### 情况 A：Prefix 命中，SWA 未被 tombstone → 完美复用
+
+```python
+# compress_hip.py:205-215 (prefill extend 时恢复 state)
+pre_state_indices = compute_state_len_indices(prefix_len, ratio)
+raw_loc = req_to_token[req_pool_indices[i], pre_state_indices]
+swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(raw_loc)
+state_loc = state_pool.translate_from_swa_loc_to_state_loc(swa_loc)
+pre_kv_state = state_pool.get_state_by_state_loc(state_loc)  # 读取 partial state
+kv_and_score_buffer = KVAndScore.cat([pre_kv_state, kv_and_score], dim=0)  # 拼接后继续累积
+```
+
+请求 B 匹配了请求 A 的前缀 → tree node 仍持有 SWA lock → SWA slot 有效 → state slot 有效 → **直接从 partial state 恢复累积，无需重计算**。
+
+示例：
+```
+prefix_len = 13, ratio = 4:
+- 已完成 3 个压缩窗口 (token 0-11) → compressed_kv[0..2] 已在 c4_kv_pool
+- 未完成: token 12 (窗口内第 1 个)
+- State buffer 存了 token 12 的 (kv, score)
+- 新请求从 token 13 继续，读取 state 后与 token 13,14,15 拼接 → 完成窗口 → 输出 compressed_kv[3]
+```
+
+#### 情况 B：Prefix 节点被 SWA tombstone → 匹配被截断
+
+SWA slot 已归还 → state 内容不可信（可能被其他请求覆盖）。
+
+`_match_prefix_helper` 中的 tombstone 感知（`swa_radix_cache.py`）确保不会使用失效的 state：
+
+```python
+if child.swa_tombstone:
+    match_len_since_tombstone = 0  # 重置计数器
+
+# 只有 tombstone 后有 ≥ sliding_window_size 个有效 token 才接受匹配
+if match_len_since_tombstone >= self.sliding_window_size:
+    best_value_len = len(value)
+```
+
+结果：prefix 匹配被截断到最后一个有完整 SWA/state 数据的位置，新请求从截断点重新 prefill。
+
+#### 情况 C：完全驱逐 → 从头计算
+
+full + SWA 都释放 → tree node 删除 → 无匹配 → 全量 prefill。
+
+### 8.9 State Pool 的设计哲学
+
+| 设计决策 | 效果 |
+|----------|------|
+| 无独立 allocator | slot 与 SWA slot 一一映射，零管理开销 |
+| 无引用计数 | 跟随 SWA pool 生命周期 |
+| 无 eviction 策略 | ring 覆写 = 隐式回收 |
+| 确定性索引公式 | 任何时候从 swa_loc 可直接算出 state_loc |
+
+Prefix cache 兼容性完全由 SWA tombstone 机制间接保证——只要 SWA slot 活着，state 就有效；SWA 被释放，compressor 不会尝试读取对应 state。
+
+### 8.10 投机解码翻倍 Ring Size 的原因
+
+```
+正常 c4:  ring_size = 8  = 2 × compress_ratio → 保留 2 个窗口
+投机 c4:  ring_size = 16 = 4 × compress_ratio → 保留 4 个窗口
+```
+
+Draft 产生的多个 token 可能在 verify 后被拒绝，需要 **回退到更早的 state 状态**。额外 2 个窗口的缓冲保证回退时 partial state 仍然可读。
+
+### 8.11 c128 在线模式的特殊 State
+
+在线 c128（`SGLANG_OPT_USE_ONLINE_COMPRESS`）使用 incremental online softmax，每个 slot 存储三元组：
+
+```
+[max | sum | kv]  各 512 维 (head_dim)，共 1536 FP32
+```
+
+更新公式（`c128_online_v2.cuh`）：
+```cpp
+// 每到达一个新 token：
+new_max = fmaxf(old_max, new_score);
+old_sum = sum * expf(old_max - new_max);
+new_exp = expf(new_score - new_max);
+new_sum = old_sum + new_exp;
+out_kv = (old_kv * old_sum + new_kv * new_exp) / new_sum;
+out_max = new_max;
+out_sum = new_sum;
+```
+
+优势：`ring_size=1`，只需 1 个 slot 即可完成 128 token 的增量压缩。
+限制：不支持投机解码（无法回退增量状态）。
+
+---
+
+## 9. 普通 c128 vs Online c128 详细对比
+
+### 9.1 核心差异：「存原始数据再一次性算」vs「逐 token 增量更新」
+
+| 维度 | 普通 c128 | Online c128 |
+|------|-----------|-------------|
+| State 存储 | 原始 (kv, score) × 128 个 | (max, sum, kv) × 1 个 |
+| last_dim | 2 × head_dim = 1024 | 3 × head_dim = 1536 |
+| ring_size | 128 | 1 |
+| 每 SWA page 内存 | 128 × 1024 × 4B = **512 KB** | 1 × 1536 × 4B = **6 KB** |
+| 内存节省 | — | **~85×** per page |
+| 计算模式 | 存满 128 个后一次性 softmax | 每个 token 增量更新 |
+| 支持投机解码 | 是 (ring_size=256) | 否 |
+| 支持 CUDA Graph | 是 | 否 |
+| 数值精度 | 一次性 softmax（数值最稳定） | 增量 softmax（理论等价，浮点误差略大） |
+
+### 9.2 普通 c128 工作流程
+
+**State Buffer 形状**：`[num_slots, 128, head_dim × 2]`
+
+每个 slot 存原始 (kv, score) 对：
+```
+[0, head_dim)     → kv    (该 token 的内容向量)
+[head_dim, 2*hd)  → score (该 token 的权重向量)
+
+一个完整 state "page" = 128 个 slot = 一整个压缩窗口的原始数据
+```
+
+**Decode 流程**（`c128_v2.cuh`）：
+
+```cpp
+// 1. 先把当前 token 的 (kv, score) 写入 buffer 对应位置
+c128_write_decode(kv_dst, kv_src);
+
+// 2. 判断是否凑齐 128 个
+if (plan.write_loc % 128 == 127) {
+    // 一次性读取 128 个 (kv, score)，执行压缩
+    c128_forward(kv_buf, kv_src, kv_out, score_bias, 128);
+}
+```
+
+**压缩算法（`c128_forward`）**：
+
+```cpp
+// 从 buffer 加载 128 个 (kv, score)
+for (j = 0..127):
+    kv[j] = load(buffer[j].kv)
+    score[j] = load(buffer[j].score) + bias[j]    // + APE
+
+// 分 16 个 warp, 每个 warp 处理 8 个位置:
+// local max → local sum → local product
+// 再 cross-warp reduction:
+global_val_max = warp::reduce_max<16>(local_val_max)
+rescale = expf(local_val_max - global_val_max)
+global_exp_sum = warp::reduce_sum<16>(local_exp_sum * rescale)
+final_scale = rescale / global_exp_sum
+global_product = warp::reduce_sum<16>(local_product * final_scale)
+
+// 输出: kv_out = Σ(kv[i] * softmax(score[i] + APE[i]))
+kv_out = global_product
+```
+
+**Prefill 流程** — 两个独立 kernel launch：
+
+```
+1. write_c128_prefill  — 把尾部 partial token 的 (kv, score) 写入 buffer
+2. flash_c128_prefill  — 对完整 128-chunk 一次性 softmax 压缩输出
+```
+
+### 9.3 Online c128 工作流程
+
+**State Buffer 形状**：`[num_slots, 1, head_dim × 3]`
+
+每个 slot 存 running state 三元组：
+```
+[0, head_dim)       → max  (running max of scores, 逐元素)
+[head_dim, 2*hd)    → sum  (running sum of exp(score - max), 逐元素)
+[2*hd, 3*hd)        → kv   (running weighted-average kv, 逐元素)
+```
+
+**Decode 流程**（`c128_online_v2.cuh:76-113`）：
+
+```cpp
+if (pos_in_chunk != 0) {
+    // Mid-chunk: 增量合并当前 token 到 running state
+    old_max = load(buffer.max);
+    old_sum = load(buffer.sum);
+    old_kv  = load(buffer.kv);
+
+    new_score = kv_score_input.score + bias[pos_in_chunk];
+    new_max = fmaxf(old_max, new_score);
+    old_sum_rescaled = old_sum * expf(old_max - new_max);   // 稳定化
+    new_exp = expf(new_score - new_max);
+    new_sum = old_sum_rescaled + new_exp;
+    out_kv = (old_kv * old_sum_rescaled + new_kv * new_exp) / new_sum;
+    out_max = new_max;
+    out_sum = new_sum;
+} else {
+    // First token of chunk: 初始化 state
+    out_kv  = new_kv;
+    out_max = new_score + bias[0];
+    out_sum = 1.0f;
+}
+
+if (pos_in_chunk == 127) {
+    // Chunk closed: state.kv 就是最终 compressed_kv, 直接输出
+    store(kv_output, out_kv);
+    // 不写回 buffer (state 自然清零, 下一个 chunk 重新 init)
+} else {
+    // 写回 running state
+    store(buffer.max, out_max);
+    store(buffer.sum, out_sum);
+    store(buffer.kv,  out_kv);
+}
+```
+
+**数学等价性**：Online softmax 与 batch softmax 计算结果相同：
+
+$$\text{out\_kv} = \frac{\sum_{i=0}^{n} \text{kv}_i \cdot e^{s_i - m}}{\sum_{i=0}^{n} e^{s_i - m}}$$
+
+其中 $m = \max(s_0, ..., s_n)$，增量维护 $(m, \sum e^{s-m}, \text{weighted\_kv})$ 三元组即可。
+
+**Prefill 流程**（`c128_online_v2.cuh:234-377`）— 也是两个 pass：
+
+```
+Pass 1 - Compress pass (kWrite=false):
+  → 对跨越 128 边界的 segment:
+    a. segment 内做 warp-tile softmax → 得到 (seg_kv, seg_max, seg_sum)
+    b. 与 prior partial state (从 buffer 读取) 做 online merge:
+       new_max = fmaxf(buf_max, seg_max)
+       new_s1 = buf_sum * expf(buf_max - new_max)
+       new_s2 = seg_sum * expf(seg_max - new_max)
+       new_sum = new_s1 + new_s2
+       new_kv = (buf_kv * new_s1 + seg_kv * new_s2) / new_sum
+    c. 输出 compressed_kv
+
+Pass 2 - Write pass (kWrite=true):
+  → 对 trailing partial segment (未凑齐 128):
+    a. 同样 segment-internal softmax
+    b. 与 prior state merge
+    c. 结果写回 state buffer (等后续 token 继续累积)
+```
+
+### 9.4 为什么 Online 模式不支持投机解码
+
+```
+投机解码流程:
+  Draft:  生成 token [n, n+1, n+2, n+3, n+4]
+  Verify: target model 验证, 假设 token n+2 被拒绝
+  回退:   需要恢复到 token n+1 时的 state
+
+普通 c128:
+  buffer 里存着所有 raw (kv, score) —— 位置独立
+  → 回退 = 忽略 n+2..n+4 的 buffer 位置, 直接从 n+1 继续
+  → ring_size=256 保证足够的回退窗口
+
+Online c128:
+  state = (max, sum, kv) 是所有已见 token 的聚合结果
+  → token n+2 的 kv/score 已经融入 running sum
+  → 无法从聚合中"减去"某个 token 的贡献
+  → 回退 = 只能从 chunk 起点重新计算 → 破坏了 online 的意义
+```
+
+### 9.5 Kernel 级性能差异
+
+| | 普通 c128 | Online c128 |
+|---|---|---|
+| **Decode 带宽** | 写 1024B/token + 凑齐时读 128×1024B | 读 1536B + 写 1536B (每 token) |
+| **Decode 计算** | 凑齐时：128-wide softmax reduction | 每 token：简单 fmaxf + expf + div |
+| **Prefill 并行度** | 高：write + compress 独立 kernel | 较低：compress + write 都需要串行读 prior state |
+| **Latency per token** | 大部分 token 只做 write (极低延迟) | 每个 token 都做 read-compute-write |
+| **Throughput** | 批量 softmax 利于 GPU 并行 | 单 token 计算量小但频率高 |
+
+### 9.6 使用场景选择
+
+```
+选普通 c128 (默认):
+  ✓ 需要投机解码 (MTP/EAGLE)
+  ✓ 需要 CUDA Graph (高吞吐场景)
+  ✓ 内存不是瓶颈
+  ✓ 追求最高计算吞吐
+
+选 Online c128:
+  ✓ 内存极度紧张 (节省 ~85× state 空间)
+  ✓ 不使用投机解码
+  ✓ 可以接受无 CUDA Graph
+  ✓ 长序列场景 (state 内存随 SWA pages 线性增长, online 模式增长极慢)
+```
+
+启用方式：
+```bash
+export SGLANG_OPT_USE_ONLINE_COMPRESS=1
+```
+
+关键代码路径：
+- 判断逻辑：`python/sglang/srt/layers/attention/dsv4/compressor_v2.py:28-30`
+- 普通 c128 kernel：`python/sglang/jit_kernel/csrc/deepseek_v4/c128_v2.cuh`
+- Online c128 kernel：`python/sglang/jit_kernel/csrc/deepseek_v4/c128_online_v2.cuh`
+- State pool 初始化：`python/sglang/srt/mem_cache/deepseek_v4_compress_state.py:96-103`
+- Ring size 选择：`python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py:37-38`
