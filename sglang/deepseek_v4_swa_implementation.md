@@ -1562,9 +1562,13 @@ if (pos_in_chunk == 127) {
 
 **数学等价性**：Online softmax 与 batch softmax 计算结果相同：
 
-$$\text{out\_kv} = \frac{\sum_{i=0}^{n} \text{kv}_i \cdot e^{s_i - m}}{\sum_{i=0}^{n} e^{s_i - m}}$$
+```
+                 Σᵢ₌₀ⁿ  kv_i · exp(s_i - m)
+  out_kv  =  ─────────────────────────────────
+                 Σᵢ₌₀ⁿ  exp(s_i - m)
+```
 
-其中 $m = \max(s_0, ..., s_n)$，增量维护 $(m, \sum e^{s-m}, \text{weighted\_kv})$ 三元组即可。
+其中 `m = max(s_0, ..., s_n)`，增量维护 `(m, Σexp(s-m), weighted_kv)` 三元组即可。
 
 **Prefill 流程**（`c128_online_v2.cuh:234-377`）— 也是两个 pass：
 
