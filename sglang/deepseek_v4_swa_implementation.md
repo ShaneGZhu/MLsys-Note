@@ -12,6 +12,178 @@ DeepSeek V4 使用**压缩稀疏注意力**，每层通过 `compress_ratio` 定�
 
 **所有层都维护 SWA KV cache（窗口大小 128）**，c4/c128 层额外维护压缩后的全局 KV。
 
+### 1.1 KV Pool 整体关联图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                        DeepSeekV4TokenToKVPool (顶层容器)                             │
+│                                                                                     │
+│  full_to_swa_index_mapping: Tensor   ← full pool loc → swa pool loc 地址翻译        │
+│  compression_ratios: [0,4,128,4,128,...] ← 每层的压缩类型                            │
+│  page_size = 256 (物理 page)                                                        │
+│  swa_page_size = 256 (= page_size, 内含 2 个 128-token FlashMLA attention page)     │
+│                                                                                     │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
+│  │                     KV 数据存储池 (所有层共享地址空间)                           │  │
+│  │                                                                               │  │
+│  │  ┌─────────────────────────────────────┐                                      │  │
+│  │  │  swa_kv_pool (DeepSeekV4SingleKVPool)│  size = full_tokens × 0.1           │  │
+│  │  │  所有层 (c0/c4/c128) 共用             │  page_size = 256                    │  │
+│  │  │  kv_buffer: [num_layers, swa_size, 584B]                                   │  │
+│  │  │  (FP8 nope 448B + BF16 rope 128B + scales 8B)                             │  │
+│  │  └──────────────────┬──────────────────┘                                      │  │
+│  │                     │ 所有层都写入 SWA                                          │  │
+│  │                     │                                                          │  │
+│  │  ┌─────────────────────────────────────┐                                      │  │
+│  │  │  c4_kv_pool (DeepSeekV4SingleKVPool) │  size = full_tokens / 4             │  │
+│  │  │  仅 c4 层使用                         │  page_size = 64 (=256/4)            │  │
+│  │  │  kv_buffer: [c4_layer_num, c4_size, 584B]                                  │  │
+│  │  │  (HiSparse 时替换为 HiSparseC4DevicePool 子类,                              │  │
+│  │  │   额外 full→device 地址映射, 支持 hot/cold page 分层)                        │  │
+│  │  └──────────────────┬──────────────────┘                                      │  │
+│  │                     │                                                          │  │
+│  │  ┌─────────────────────────────────────┐                                      │  │
+│  │  │  c128_kv_pool (DeepSeekV4SingleKVPool)│ size = full_tokens / 128           │  │
+│  │  │  仅 c128 层使用                       │  page_size = 2 (=256/128)           │  │
+│  │  │  kv_buffer: [c128_layer_num, c128_size, 584B]                              │  │
+│  │  └──────────────────┬──────────────────┘                                      │  │
+│  │                     │                                                          │  │
+│  │  ┌─────────────────────────────────────┐                                      │  │
+│  │  │  c4_indexer_kv_pool (IndexerPool)    │  size = full_tokens / 4             │  │
+│  │  │  仅 c4 层使用 (top-k 选择用)          │  page_size = 64                     │  │
+│  │  │  index_k_with_scale_buffer: [c4_layer_num, c4_size, 132B]                  │  │
+│  │  │  (indexer_head_dim=128 + quant_scales=4B)                                  │  │
+│  │  └─────────────────────────────────────┘                                      │  │
+│  └───────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                     │
+│  ┌───────────────────────────────────────────────────────────────────────────────┐  │
+│  │                     Compress State 环形缓冲池 (压缩中间状态)                     │  │
+│  │                                                                               │  │
+│  │  compress_state_pools: List[CompressStatePool]   ← 每层一个 (c4/c128)         │  │
+│  │                                                                               │  │
+│  │  ┌────────────────────────────────────────────────────┐                       │  │
+│  │  │  c4 层 state pool                                   │                       │  │
+│  │  │  size = swa_tokens / swa_page_size × ring_size      │                       │  │
+│  │  │  ring_size = 8 (非投机) / 16 (投机)                  │                       │  │
+│  │  │  last_dim = 2 × 2 × head_dim (overlap=1, kv+score)  │                       │  │
+│  │  │  shape: [pool_size, ring_size, last_dim] (FP32)      │                       │  │
+│  │  └────────────────────────────────────────────────────┘                       │  │
+│  │                                                                               │  │
+│  │  ┌────────────────────────────────────────────────────┐                       │  │
+│  │  │  c128 层 state pool (普通模式)                       │                       │  │
+│  │  │  size = swa_tokens / swa_page_size × ring_size      │                       │  │
+│  │  │  ring_size = 128 (非投机) / 256 (投机)               │                       │  │
+│  │  │  last_dim = 2 × head_dim (kv + score)               │                       │  │
+│  │  │  shape: [pool_size, ring_size, last_dim] (FP32)      │                       │  │
+│  │  └────────────────────────────────────────────────────┘                       │  │
+│  │  ┌────────────────────────────────────────────────────┐                       │  │
+│  │  │  c128 层 state pool (Online 模式)                    │                       │  │
+│  │  │  ring_size = 1                                      │                       │  │
+│  │  │  last_dim = 3 × head_dim (max + sum + kv)           │                       │  │
+│  │  │  shape: [pool_size, 1, last_dim] (FP32)             │                       │  │
+│  │  └────────────────────────────────────────────────────┘                       │  │
+│  │                                                                               │  │
+│  │  indexer_compress_state_pools: List[CompressStatePool]  ← 仅 c4 层            │  │
+│  │  (与 compress_state_pools 结构相同, head_dim=indexer_head_dim=128)            │  │
+│  └───────────────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 1.2 Pool 之间的数据流向
+
+```
+输入 token hidden_state
+       │
+       ▼
+  ┌────────────────┐
+  │ fused_qk_norm_  │    所有层：RMSNorm + RoPE + FP8量化 → 写入 SWA pool
+  │ rope_swa_store  │───────────────────────────────────────► swa_kv_pool
+  └────────────────┘
+       │
+       ▼ (c4/c128 层额外执行)
+  ┌────────────────┐
+  │  Compressor     │    wkv_gate 投影 → 产生 (kv, score)
+  │  wkv_gate       │
+  └────────────────┘
+       │
+       ├─── score+APE+kv ──► compress_state_pools  (环形缓冲区暂存)
+       │                          │
+       │                          │ 凑齐 ratio 个 token 后触发压缩
+       │                          ▼
+       │                    ┌──────────────┐
+       │                    │  Softmax +    │
+       │                    │  Weighted Sum │  per-element softmax → compressed_kv
+       │                    └──────┬───────┘
+       │                           │
+       │         ┌─────────────────┼──────────────────┐
+       │         ▼                 ▼                   ▼
+       │   c4_kv_pool        c128_kv_pool      c4_indexer_kv_pool
+       │   (压缩后KV)         (压缩后KV)        (压缩后indexer KV)
+       │
+       ▼ Attention 计算 (FlashMLA)
+  ┌──────────────────────────────────────────────────────────────────┐
+  │                                                                  │
+  │  Q × swa_kv_pool (最近128 tokens)                                │
+  │     +                                                            │
+  │  Q × c4_kv_pool[top-k pages]    ← c4_indexer 选出 top-k pages   │
+  │     或                                                           │
+  │  Q × c128_kv_pool[all pages]                                     │
+  │                                                                  │
+  │  → flash_mla.flash_mla_with_kvcache(                             │
+  │        indices=swa_pages,                                        │
+  │        extra_indices=c4/c128_pages                                │
+  │    )                                                             │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+### 1.3 地址映射关系
+
+```
+req_to_token_pool (per-request 全局 token 地址)
+       │
+       │ out_cache_loc (full pool 中的物理位置)
+       │
+       ├──────────────────────────────────────────────┐
+       │                                              │
+       ▼                                              ▼
+ full_to_swa_index_mapping[loc]              full pool loc / page_size
+       │                                              │
+       ▼                                              ▼
+  swa_kv_pool loc                              page_table index
+  (写入 SWA KV)                                (c4/c128 pool 共用 page 编号)
+                                                      │
+                                              ┌───────┼───────┐
+                                              ▼       ▼       ▼
+                                          c4_pool  c128_pool  indexer_pool
+                                          page内    page内     page内
+                                          offset    offset     offset
+                                          =loc%64   =loc%2     =loc%64
+
+  State pool 寻址:
+    swa_page_id = swa_loc / swa_page_size
+    state_slot  = swa_page_id × ring_size + (swa_loc % ring_size)
+```
+
+### 1.4 Pool 大小比例关系 (以 full_tokens=F 为基准)
+
+```
+┌─────────────────────┬────────────────────────────────────────┐
+│       Pool          │          Size (tokens/slots)           │
+├─────────────────────┼────────────────────────────────────────┤
+│ full (逻辑)          │ F                                      │
+│ swa_kv_pool         │ F × 0.1  (swa_full_tokens_ratio)       │
+│ c4_kv_pool          │ F / 4                                  │
+│ c128_kv_pool        │ F / 128                                │
+│ c4_indexer_kv_pool  │ F / 4   (= c128_size × 32)            │
+│ c4_state_pool       │ (F×0.1 / 256) × 8                     │
+│ c128_state_pool     │ (F×0.1 / 256) × 128  (普通)            │
+│ c128_state_pool     │ (F×0.1 / 256) × 1    (online)         │
+└─────────────────────┴────────────────────────────────────────┘
+
+注: state_pool size = swa_tokens / swa_page_size × ring_size
+    swa_page_size = 256 (物理页); swa_tokens = F × 0.1
+```
+
 配置来源：`python/sglang/srt/configs/deepseek_v4.py`
 ```python
 window_size: int = 128
@@ -28,7 +200,7 @@ compress_ratios: List[int]  # 每层的 compress_ratio，如 [0, 4, 128, 4, 128,
 BaseSWAKVPool (base_swa_memory_pool.py)
 └── DeepSeekV4TokenToKVPool (deepseek_v4_memory_pool.py)
     ├── swa_kv_pool: DeepSeekV4SingleKVPool   # 所有层共用的 SWA KV 存储
-    ├── c4_kv_pool: HiSparseC4DevicePool      # c4 压缩 KV
+    ├── c4_kv_pool: DeepSeekV4SingleKVPool    # c4 压缩 KV (HiSparse时为子类 HiSparseC4DevicePool)
     ├── c128_kv_pool: DeepSeekV4SingleKVPool   # c128 压缩 KV
     ├── full_to_swa_index_mapping: Tensor      # full 索引 → SWA 索引映射
     └── cached_loc: Optional[Tensor]           # 缓存的翻译结果
@@ -211,6 +383,179 @@ else:
 失效场景：
 - `register_mapping()` 被调用时（mapping 变化）
 - 手动调用 `invalidate_loc_cache()`
+
+### 2.6 Page 分配与管理机制
+
+#### 2.6.1 双 Allocator 架构
+
+DSV4 使用 `SWATokenToKVPoolAllocator`，内部持有两个**独立的** `PagedTokenToKVPoolAllocator`：
+
+```
+SWATokenToKVPoolAllocator (swa_memory_pool.py:305)
+├── full_attn_allocator: PagedTokenToKVPoolAllocator
+│     size = full_max_total_num_tokens (大)
+│     管理 full pool 的 page 分配/释放
+│
+├── swa_attn_allocator: PagedTokenToKVPoolAllocator
+│     size = swa_max_total_num_tokens (小, = full × 0.1)
+│     管理 swa pool 的 page 分配/释放
+│
+└── full_to_swa_index_mapping: Tensor[full_size]
+      full loc → swa loc 的逐 token 翻译表
+```
+
+每个 `PagedTokenToKVPoolAllocator` 维护一个 `free_pages` 列表（GPU tensor），以 page 为粒度管理空间：
+
+```python
+# allocator.py:362-405
+class PagedTokenToKVPoolAllocator:
+    num_pages = size // page_size     # 总页数
+    free_pages: Tensor                # 空闲页号列表 (GPU)
+
+    def alloc(need_size):
+        num_pages = need_size // page_size
+        out_pages = free_pages[:num_pages]      # 取 N 个空闲页
+        free_pages = free_pages[num_pages:]     # 从空闲列表中移除
+        # 展开为 token-level indices:
+        out_indices = out_pages[:, None] * page_size + arange(page_size)
+        return out_indices.reshape(-1)          # [num_pages × 256]
+```
+
+#### 2.6.2 同步分配与映射建立
+
+每次 `alloc_extend` 时，full 和 swa 各分配相同数量的 page，然后逐 token 建立映射：
+
+```
+alloc_extend(prefix_lens, seq_lens, last_loc, extend_num_tokens):
+    │
+    ├─► full_attn_allocator.alloc_extend(...)
+    │     → alloc_full_indices = [768, 769, ..., 1023, 1792, ..., 2047]
+    │
+    ├─► swa_attn_allocator.alloc_extend(swa_last_loc, ...)
+    │     → alloc_swa_indices  = [256, 257, ..., 511, 1280, ..., 1535]
+    │
+    └─► full_to_swa_index_mapping[alloc_full_indices] = alloc_swa_indices
+          mapping[768]  = 256
+          mapping[769]  = 257
+          ...
+          mapping[1792] = 1280
+          mapping[1793] = 1281
+          ...
+```
+
+**返回给上层的始终是 `alloc_full_indices`**（full pool 地址），SWA 地址通过 mapping 查询。
+
+#### 2.6.3 Page 内部 token 写入
+
+SWA page_size=256，每个 page 内 256 个 slot **全部会被写满**：
+
+```
+┌──────────────────────── 一个 SWA page (256 slots) ────────────────────────────┐
+│ slot[0] │ slot[1] │ ... │ slot[127] │ slot[128] │ ... │ slot[255]            │
+│◄────── FlashMLA logical page 0 ──────►│◄────── FlashMLA logical page 1 ────►│
+│          128 tokens (attention page)   │          128 tokens                  │
+└───────────────────────────────────────────────────────────────────────────────┘
+
+每个 slot 存 584 bytes: FP8_nope(448B) + BF16_rope(128B) + scales(8B)
+```
+
+token 逐个写入：每生成一个 token → `fused_qk_norm_rope_swa_store` 写入 `swa_kv_pool[swa_loc]`。
+当 256 slots 写满后，下次分配新 page 继续写。
+
+#### 2.6.4 c4/c128 Pool 无独立 Allocator
+
+c4/c128 pool 不需要独立的分配器。它们的地址直接由 full page 编号派生：
+
+```
+full page 结构 (page_size=256):
+┌─────────────────────────────────────────────────────────────────────┐
+│ token[0] token[1] ... token[3] │ token[4] ... token[7] │ ... │     │
+│       c4 slot 0                │     c4 slot 1          │           │
+│◄──── 4 tokens → 1 compressed KV ────►                              │
+│                                                                     │
+│ 一个 full page (256 tokens) → c4 page (64 compressed entries)       │
+│ 一个 full page (256 tokens) → c128 page (2 compressed entries)      │
+└─────────────────────────────────────────────────────────────────────┘
+
+c4_loc  = full_page_id × 64 + (offset_in_page / 4)
+c128_loc = full_page_id × 2 + (offset_in_page / 128)
+```
+
+压缩完成后，由 compressor kernel 直接写入 `c4_kv_pool[c4_loc]` / `c128_kv_pool[c128_loc]`，
+地址通过 full page 编号一步算出，不需要额外分配/释放。
+
+#### 2.6.5 SWA Tombstone 机制：为什么 SWA pool 远小于 full pool 却够用
+
+**核心设计：SWA page 可以被独立回收，而 full page 保留在 radix cache 中。**
+
+```
+请求 A 结束后:
+┌─────────────────────────────────────────────────────────────────────┐
+│ Radix Cache                                                         │
+│                                                                     │
+│  Node: "Hello world how are you"                                    │
+│    full pages: [page_3, page_7, page_12, page_18]  ← 保留          │
+│    swa pages:  [page_1, page_5, page_9, page_14]   ← 可驱逐!       │
+│    c4/c128 compressed KV:                          ← 跟随 full 存活 │
+│                                                                     │
+│  SWA 驱逐流程 (swa_radix_cache.py:621):                             │
+│    1. free_swa(node.value)                                          │
+│       → swa_attn_allocator.free(swa_indices)  // swa page 回收      │
+│       → mapping[full_indices] = 0             // 映射清零            │
+│    2. node.swa_tombstone = True               // 标记 "SWA 已驱逐"  │
+│    3. full page + c4/c128 data 不受影响                              │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**后续请求命中相同前缀时 (prefix cache hit)**：
+
+```
+请求 B: "Hello world how are you doing today ..."
+  │
+  ├─ Radix tree 匹配到 "Hello world how are you" 前缀
+  │   full page 直接复用 → c4/c128 compressed KV 仍有效 ✓
+  │
+  ├─ 检测到 node.swa_tombstone = True
+  │   → 需要重新分配 SWA page
+  │   → 只需重算最近 window_size (128) tokens 的 SWA KV
+  │   → 远比重新 prefill 整个前缀便宜
+  │
+  └─ 继续生成新 token
+```
+
+**设计动机**：
+
+| Pool | 大小比例 | 生命周期 | 为什么 |
+|------|---------|----------|--------|
+| full pool | F (100%) | 长期持有，prefix cache 驱逐 | 保存全局 token 位置 + c4/c128 地址基础 |
+| swa pool | F×0.1 (10%) | 短期，可被 tombstone | 只为**当前活跃请求**保留 SWA KV |
+| c4/c128 pool | F/4, F/128 | 跟随 full page | 压缩后 KV 复用价值高，不轻易驱逐 |
+
+**为什么 0.1 就够**：系统同时活跃的 token 数远少于 radix cache 中的总 token 数。
+例如 10 个并发请求各有 128 tokens 窗口 = 1280 tokens SWA 需求，
+而 radix cache 可能缓存了上万 tokens 的 full+compressed KV。
+
+#### 2.6.6 释放流程
+
+```
+完整释放 (请求结束 + 无 prefix cache 价值):
+  allocator.free(full_indices)
+    → full_attn_allocator.free(full_indices)    // 回收 full pages
+    → free_swa(full_indices)                    // 回收 swa pages + 清映射
+
+仅释放 SWA (tombstone, prefix cache 保留 full):
+  allocator.free_swa(full_indices)
+    → swa_indices = mapping[full_indices]
+    → swa_indices = swa_indices[swa_indices > 0]  // 过滤已清零的
+    → swa_attn_allocator.free(swa_indices)        // 回收 swa pages
+    → mapping[full_indices] = 0                   // 清映射
+```
+
+关键代码路径：
+- `SWATokenToKVPoolAllocator`：`swa_memory_pool.py:305-635`
+- `PagedTokenToKVPoolAllocator`：`allocator.py:362-530`
+- SWA 驱逐：`swa_radix_cache.py:615-654`
+- 初始化入口：`model_runner_kv_cache_mixin.py:706-714`
 
 ---
 
