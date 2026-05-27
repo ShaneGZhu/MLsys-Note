@@ -56,6 +56,131 @@ c4 pool size  = full_pool_tokens / 4
 c128 pool size = full_pool_tokens / 128
 ```
 
+#### 2.3.1 `full_pool_tokens` 的计算链路
+
+```
+GPU 总显存
+  │
+  ▼ 模型加载后剩余显存 × mem_fraction_static
+  │
+  ▼ _profile_available_bytes()  (model_runner_kv_cache_mixin.py:62-76)
+  │
+available_bytes (字节)
+  │
+  ▼ full_token = available_bytes / bytes_per_full_token
+  │                                     ↑
+  │                      _get_bytes_per_full_token() 计算的每 full token 总字节成本
+  │
+full_token (page 对齐后) ← 即 full_pool_tokens
+```
+
+计算可用字节（`model_runner_kv_cache_mixin.py:62-76`）：
+
+```python
+def _profile_available_bytes(self, pre_model_load_memory):
+    post_model_load_memory = get_available_gpu_memory(...)  # 模型加载后剩余 (GB)
+    # rest = mem_fraction_static 比例的空闲 GPU 显存
+    rest_memory = post_model_load_memory - pre_model_load_memory * (1 - self.mem_fraction_static)
+    return int(rest_memory * (1 << 30))  # GB → bytes
+```
+
+#### 2.3.2 `bytes_per_full_token`：每个 full token 的总成本
+
+一个 full token 的 "成本" 是其在**所有 pool** 中摊销费用之和（`pool_configurator.py:372-410`）：
+
+```python
+def _get_bytes_per_full_token(self) -> float:
+    kv_bytes = qk_nope_head_dim + qk_rope_head_dim * 2 + 8  # = 448 + 128 + 8 = 584
+    # ... indexer_bytes, state_bytes 等
+
+    return (
+        swa_ratio × kv_bytes × num_layers_total           # SWA pool (每 full token 摊 0.1 份)
+      + 1/4 × kv_bytes × num_layers_ca4                   # c4 KV pool
+      + 1/128 × kv_bytes × num_layers_ca128               # c128 KV pool
+      + 1/4 × indexer_bytes × num_layers_ca4              # indexer pool
+      + swa_ratio × (c4_ring/swa_page) × c4_state_bytes × num_layers_ca4    # c4 state
+      + swa_ratio × (c128_ring/swa_page) × c128_state_bytes × num_layers_ca128  # c128 state
+      + swa_ratio × (c4_ring/swa_page) × c4_indexer_state_bytes × num_layers_ca4
+    )
+```
+
+**关键洞察：`bytes_per_full_token` 已经把 SWA、c4、c128、state 全部摊进去了。** 因此 `available_bytes / bytes_per_full_token` 直接得到 `full_token`，其余 pool 大小按固定比例推导。
+
+#### 2.3.3 `_compute_dsv4_sizes`：从 full_token 推导所有 pool
+
+```python
+# pool_configurator.py:412-422
+def _compute_dsv4_sizes(self, full_token: int, page_size: int) -> _DSV4PoolSizes:
+    full_token = full_token // page_size * page_size                        # page 对齐
+    swa_tokens = int(full_token * self.swa_ratio) // page_size * page_size  # SWA pool
+    return _DSV4PoolSizes(
+        full_max_total_num_tokens=full_token,                               # radix tree 主索引
+        swa_max_total_num_tokens=swa_tokens,                                # 滑动窗口 KV
+        c4_max_total_num_tokens=full_token // (4 * self.c4_shrink_factor),  # c4 压缩 KV
+        c128_max_total_num_tokens=full_token // 128,                        # c128 压缩 KV
+        c4_state_pool_size=swa_tokens // self.swa_page_size * self.c4_ring_size,   # c4 ring buffer
+        c128_state_pool_size=swa_tokens // self.swa_page_size * self.c128_ring_size, # c128 ring buffer
+    )
+```
+
+各 pool 之间的固定比例关系：
+
+```
+full_token = N (基准, 由 available_bytes / bytes_per_full_token 得出)
+  │
+  ├── swa_tokens       = N × 0.1              ← swa_full_tokens_ratio
+  ├── c4_tokens        = N / 4                ← compress_ratio=4
+  ├── c128_tokens      = N / 128              ← compress_ratio=128
+  ├── c4_state_slots   = (N×0.1/128) × 8     ← swa_pages × ring_size
+  └── c128_state_slots = (N×0.1/128) × 128   ← swa_pages × ring_size
+```
+
+比例来源：
+- **`/4`, `/128`**：压缩比，论文定义（每 4/128 个 token 压缩成 1 个）
+- **`×0.1`**：`swa_full_tokens_ratio`，CLI 可配（`--swa-full-tokens-ratio`）
+- **state**：从 SWA pages 数 × ring_size 得出（见 §8.7）
+
+#### 2.3.4 投机解码的额外膨胀
+
+使用 speculative decoding 时，`bytes_per_full_token` 按 `(T+D)/T` 比例膨胀：
+
+```python
+# pool_configurator.py:353-360
+if self.is_speculative:
+    draft_layers = 1
+    target_layers = self.num_layers_total
+    self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
+```
+
+效果：同样的显存，full_token 数量略减，为 draft worker 预留 KV cache 空间。
+
+#### 2.3.5 用户约束覆盖
+
+若用户设置 `--max-total-tokens`，跳过 profiling，直接以用户值作为 `full_token`：
+
+```python
+# model_runner_kv_cache_mixin.py:887-891
+constrained = self._apply_token_constraints(config.max_total_num_tokens)
+if constrained != config.max_total_num_tokens:
+    config = configurator.calculate_pool_sizes_from_max_tokens(constrained, page_size)
+```
+
+#### 2.3.6 数值示例
+
+假设 80GB A100，模型加载后剩余 40GB，`mem_fraction_static=0.88`，61 层 DSV4：
+
+```
+available_bytes ≈ 35.2 GB ≈ 37.6 × 10⁹ bytes
+bytes_per_full_token ≈ 9,700 bytes (示意值，视层配置而异)
+
+full_token ≈ 37.6G / 9,700 ≈ 3,870,000 tokens (page 对齐后)
+  → swa_tokens   ≈ 387,000
+  → c4_tokens    ≈ 967,500
+  → c128_tokens  ≈ 30,200
+  → c4_state     ≈ 387,000/128 × 8 = 24,187 slots/layer
+  → c128_state   ≈ 387,000/128 × 128 = 387,000 slots/layer
+```
+
 ### 2.4 索引映射机制
 
 SWA pool 和 full pool 使用不同的索引空间。通过 `full_to_swa_index_mapping` 做翻译：
