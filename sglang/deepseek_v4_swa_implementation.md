@@ -91,47 +91,144 @@ else:
 
 ## 3. SWA KV 写入路径
 
-### 3.1 标准路径（HIP/AMD）
+### 3.1 调用入口
+
+`python/sglang/srt/models/deepseek_v4.py:578-605`：
 
 ```python
-# deepseek_v4.py:582-605 (_forward_prepare 中 _is_hip=True 分支)
+from sglang.srt.layers.fused_qk_norm_rope_store import fused_qk_norm_rope_swa_store
+
 token_to_kv_pool = get_token_to_kv_pool()
 swa_loc = token_to_kv_pool.translate_loc_from_full_to_swa(forward_batch.out_cache_loc)
 swa_cache = token_to_kv_pool.swa_kv_pool.kv_buffer[self.layer_id]
+swa_page_size = token_to_kv_pool.swa_kv_pool.page_size
 
-# 融合 kernel: q_norm + kv_norm + rope + SWA cache 写入
 q = fused_qk_norm_rope_swa_store(
     q=q, kv=kv,
-    swa_cache=swa_cache,
-    swa_loc=swa_loc,
+    kv_norm_weight=self.kv_norm.weight,
+    swa_cache=swa_cache,       # 目标: [num_pages, bytes_per_page] uint8 buffer
+    swa_loc=swa_loc,           # [num_tokens] int32, 翻译后的 SWA 物理索引
     swa_page_size=swa_page_size,
+    cos_cache=self.cos_cache,
+    sin_cache=self.sin_cache,
+    positions=positions,
     ...
 )
 ```
 
-### 3.2 Fused 路径（CUDA）
+### 3.2 Fused Triton Kernel
 
-`set_swa_key_buffer_radix_fused()`：将 norm + rope + quantize + store 融合为单个 JIT kernel：
+写入在 `python/sglang/srt/layers/fused_qk_norm_rope_store.py:199-267` 的 Triton kernel 中完成，
+与 Q/KV RMSNorm + RoPE **融合在同一个 kernel** 中，避免额外的 global memory round-trip。
 
-```python
-# deepseek_v4_memory_pool.py (set_swa_key_buffer_radix_fused)
-fused_k_norm_rope_flashmla(
-    input=cache_k,
-    output=swa_cache,
-    indices=swa_loc,
-    ...
-)
+融合的步骤：
+```
+kv (BF16, hidden_size → head_dim=512 经 wkv 投影)
+  │
+  ▼ RMSNorm (kv_norm_weight)
+  │
+  ├── nope 部分 (前 448 维): 写回 kv in-place
+  └── rope 部分 (后 64 维):  → RoPE 旋转 → 写回 kv in-place
+  │
+  ▼ Paged SWA Store (在同一 kernel 中)
+  │
+  ├── nope: per-tile FP8 量化 → 写入 swa_cache
+  ├── rope: BF16 直接写入 swa_cache
+  └── scales: uint8 写入 swa_cache
 ```
 
-底层调用 `sglang/jit_kernel/dsv4/fused_k_norm_rope_flashmla` 和 `fused_store_cache`。
+### 3.3 每 Token 存储布局（584 字节）
 
-### 3.3 store_cache（Backend 入口）
+SWA cache 以 paged 方式组织：`swa_kv_pool.kv_buffer[layer_id]` 形状为 `[num_pages, bytes_per_page_padded]`。
+
+每个 page 内按 token 顺序存储（`swa_page_size` 个 token），每 token 布局：
+
+```
+Page 布局:
+┌─────── Values 区域: page_size × 576 bytes ───────┐
+│ Token 0: [448B FP8 nope | 128B BF16 rope]        │
+│ Token 1: [448B FP8 nope | 128B BF16 rope]        │
+│ ...                                               │
+│ Token N: [448B FP8 nope | 128B BF16 rope]        │
+├─────── Scales 区域: page_size × 8 bytes ─────────┤
+│ Token 0: [7B scales | 1B pad]                    │
+│ Token 1: [7B scales | 1B pad]                    │
+│ ...                                               │
+└───────────────────────────────────────────────────┘
+
+每 token 总计: 576 + 8 = 584 字节
+```
+
+各分量详解：
+
+| 分量 | 维度 | 存储类型 | 大小 | 说明 |
+|------|------|----------|------|------|
+| nope | 448 (qk_nope_head_dim) | **float8_e4m3fn** | 448 字节 | KV 经 RMSNorm 后量化 |
+| rope | 64 (qk_rope_head_dim) | **bfloat16** | 128 字节 | KV 经 RoPE 后,不量化 |
+| scales | 7 tiles (448/64) | **uint8** (指数编码) | 7 字节 | per-tile 量化 scale |
+| pad | — | — | 1 字节 | 对齐 |
+
+### 3.4 FP8 量化策略
+
+**Per-tile absmax + power-of-2 scale**（`fused_qk_norm_rope_store.py:224-258`）：
 
 ```python
-# deepseek_v4_backend.py:982
+# 每 tile = 64 维, 共 7 tiles (448/64)
+for tile_i in range(7):
+    tile_data = kv_normed[tile_start : tile_start + 64]  # [BLOCK_M, 64] float32
+
+    # 1. 求 tile 内最大绝对值
+    abs_max = max(abs(tile_data))
+
+    # 2. 计算 2 的幂次 scale (保证 dequant 是精确乘法)
+    scale_pow2 = exp2(ceil(log2(abs_max / FP8_MAX)))
+
+    # 3. 量化到 FP8
+    x_fp8 = clamp(tile_data / scale_pow2, FP8_MIN, FP8_MAX).to(float8_e4m3fn)
+
+    # 4. scale 编码为 uint8 (biased exponent: ceil_log2 + 127)
+    scale_uint8 = (ceil_log2 + 127).to(uint8)
+
+    # 写入
+    store(swa_cache + value_base + tile_start, x_fp8)       # 64 bytes FP8
+    store(swa_cache + scale_base + tile_i, scale_uint8)     # 1 byte scale
+```
+
+**为什么 scale 用 2 的幂次**：dequant 时 `x_real = x_fp8 * scale_pow2`，乘 2 的幂次在浮点中是精确的（只改指数位），无舍入误差。
+
+### 3.5 RoPE 部分为什么不量化
+
+- rope 维度只有 64（vs nope 的 448），BF16 只需 128 字节，占比小
+- rope 编码位置信息，量化会损失位置区分度（频率分辨率）
+- 总开销：128B BF16 vs 64B FP8 + 1B scale，节省有限但精度损失显著
+
+### 3.6 Kernel 内的寻址计算
+
+```python
+# Triton kernel 中的 page 内寻址
+loc = tl.load(swa_loc_ptr + token_id)         # SWA 物理索引
+page_id = loc // SWA_PAGE_SIZE                 # 属于哪个 page
+page_off = loc % SWA_PAGE_SIZE                 # page 内第几个 token
+
+VALUE_STRIDE = 448 + 64*2  # = 576 bytes/token (nope + rope)
+SCALE_BYTES = 7 + 1        # = 8 bytes/token (scales + pad)
+
+value_base = page_id * page_stride + page_off * VALUE_STRIDE
+scale_base = page_id * page_stride + SWA_PAGE_SIZE * VALUE_STRIDE + page_off * SCALE_BYTES
+```
+
+### 3.7 store_cache 备用路径（Backend 入口）
+
+非融合路径，用于 Context Parallelism 等场景：
+
+```python
+# deepseek_v4_backend.py
 if save_kv_cache:
     self.store_cache(layer_id, swa_k, forward_batch)
 ```
+
+此路径调用 `set_swa_key_buffer_radix_fused()` 或 `fused_k_norm_rope_flashmla` JIT kernel，
+功能相同（norm + rope + FP8 quant + paged store）但通过不同代码路径触发。
 
 ---
 
@@ -1299,6 +1396,9 @@ kv_out = global_product
 [2*hd, 3*hd)        → kv   (running weighted-average kv, 逐元素)
 ```
 
+**形状解读**：中间维度 `1` = ring_size=1（每个 SWA page 只需 1 个时间槽）；
+last_dim = `head_dim × 3` 因为三元组是**逐元素**的（每个维度 d 独立维护自己的 max/sum/kv），详见 §9.7。
+
 **Decode 流程**（`c128_online_v2.cuh:76-113`）：
 
 ```cpp
@@ -1419,3 +1519,112 @@ export SGLANG_OPT_USE_ONLINE_COMPRESS=1
 - Online c128 kernel：`python/sglang/jit_kernel/csrc/deepseek_v4/c128_online_v2.cuh`
 - State pool 初始化：`python/sglang/srt/mem_cache/deepseek_v4_compress_state.py:96-103`
 - Ring size 选择：`python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py:37-38`
+
+### 9.7 论文公式与代码的对应：Per-Element Softmax
+
+DSV4 论文（HCA 部分）公式：
+
+$$C = H \cdot W_{KV}, \quad Z = H \cdot W_Z \quad \text{(Eq. 20-21)}$$
+
+$$S_{m'i:m'(i+1)-1} = \text{Softmax}_{\text{row}}(Z_{m'i:m'(i+1)-1} + B) \quad \text{(Eq. 22)}$$
+
+$$C^{\text{Comp}}_i = \sum_{j=m'i}^{m'(i+1)-1} S_j \odot C_j \quad \text{(Eq. 23)}$$
+
+其中 $\odot$ 为 Hadamard（逐元素）乘积。
+
+#### `Softmax_row` 的含义
+
+$Z_{m'i:m'(i+1)-1} + B$ 是 $[m' \times c]$ 矩阵。`Softmax_row` 表示**对每一列（每个维度 d）独立做 softmax，归一化方向是行轴（position）**：
+
+```
+       d=0    d=1    d=2   ...  d=511
+pos 0: z₀₀    z₀₁    z₀₂        z₀,₅₁₁
+pos 1: z₁₀    z₁₁    z₁₂        z₁,₅₁₁
+  ...
+pos 127: z₁₂₇,₀  ...              z₁₂₇,₅₁₁
+         ↓      ↓      ↓            ↓
+     softmax softmax softmax    softmax   ← 每列独立归一化, Σⱼ S[j,d]=1
+```
+
+因此对输出的每个维度 d：
+
+$$C^{\text{Comp}}_i[d] = \sum_{j=0}^{127} S_j[d] \cdot C_j[d], \quad \text{其中} \sum_{j=0}^{127} S_j[d] = 1$$
+
+**每个维度 d 有自己独立的 softmax 归一化因子**——这就是压缩操作的核心特征。
+
+#### 论文到代码的映射
+
+| 论文 | 代码 | 说明 |
+|------|------|------|
+| $W_{KV} \in \mathbb{R}^{d \times c}$ | `wkv_gate` 前半部分输出 | 产生 kv (内容) |
+| $W_Z \in \mathbb{R}^{d \times c}$ | `wkv_gate` 后半部分输出 | 产生 score (权重) |
+| $C_j$ (KV entry) | `kv_score_input[..., :head_dim]` | state 中的 "kv" |
+| $Z_j$ (权重) | `kv_score_input[..., head_dim:]` | state 中的 "score" |
+| $B$ (位置偏置) | `self.ape` | 可学习 APE 参数 |
+| $\text{Softmax}_{\text{row}}$ | per-element softmax across positions | 代码中逐维度归一化 |
+| $\odot$ (Hadamard) | `kv[j][i] * exp_score` | 逐元素加权 |
+
+代码中 `wkv_gate` 将论文的两次投影合并为一次：
+```python
+# 论文: C = H·W_KV, Z = H·W_Z  (两次矩阵乘)
+# 代码: [C, Z] = H·wkv_gate     (一次矩阵乘, 输出拼接)
+self.wkv_gate = ReplicatedLinear(dim, 2 * coff * head_dim)
+```
+
+#### 为什么 Online 三元组必须是 per-element
+
+由于每个维度 d 的 softmax 归一化因子不同：
+
+```
+维度 d=0:  Σⱼ exp(score_j[0] - max_0) = sum_0    ← 独立的 (max₀, sum₀)
+维度 d=1:  Σⱼ exp(score_j[1] - max_1) = sum_1    ← 独立的 (max₁, sum₁)
+...
+维度 d=511: Σⱼ exp(score_j[511] - max_511) = sum_511
+```
+
+Online 增量计算需要为每个维度维护独立的 running state：
+
+```
+max[512]  — 每个维度各自的 running max（数值稳定化）
+sum[512]  — 每个维度各自的 running Σexp(s-max)
+kv[512]   — 每个维度各自的 weighted average result
+```
+
+共 3 × 512 = 1536 floats → `[num_slots, 1, head_dim × 3]`。
+
+如果压缩公式不用 $\odot$ 而是标量权重 $S_j \cdot C_j$（所有维度共享同一归一化因子），则 state 只需
+`(1 scalar max, 1 scalar sum, 512-dim kv)` = 514 floats。但论文的 **per-element $\odot$ + Softmax\_row 组合
+决定了 state 必须是 3×head_dim 维的**。
+
+#### CUDA kernel 中的对应
+
+普通 c128 kernel（`c128_v2.cuh:143-166`）：
+```cpp
+// j 遍历 128 个 position (每 warp 8 个), i 遍历 tile elements (head_dim 分片)
+for (int32_t i = 0; i < kTileElements; ++i) {         // ← 逐元素
+    for (int32_t j = 0; j < kElementsPerWarp; ++j) {  // ← 跨 position
+        score_fp32[i][j] = cast<float>(score[j][i]) + cast<float>(bias[j][i]);
+    }
+    // 对 j 方向做 max → exp → sum → weighted sum
+    float max_value = score_fp32[i][0];
+    for (j = 1..7): max_value = fmaxf(max_value, score_fp32[i][j]);
+    for (j = 0..7):
+        exp_score = expf(score_fp32[i][j] - max_value);
+        sum_product += kv[j][i] * exp_score;      // ← ⊙ 对应
+        sum_exp_value += exp_score;
+}
+// 然后 cross-warp reduction 合并 16 个 warp 的 partial results
+```
+
+Online c128 kernel（`c128_online_v2.cuh:82-93`）：
+```cpp
+for (uint32_t i = 0; i < kVecSize; ++i) {     // ← 逐元素 (每个维度独立)
+    new_max = fmaxf(old_max, new_score);       // 该维度的 running max
+    old_sum = sum_score_vec[i] * expf(old_max - new_max);
+    new_exp = expf(new_score - new_max);
+    new_sum = old_sum + new_exp;               // 该维度的 running sum
+    out_kv_vec[i] = (old_kv * old_sum + new_kv * new_exp) / new_sum;  // 该维度的 avg
+}
+```
+
+两种实现数学上等价，都是 per-element softmax across positions。
