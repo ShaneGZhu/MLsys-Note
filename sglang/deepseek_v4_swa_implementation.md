@@ -21,7 +21,7 @@ DeepSeek V4 使用**压缩稀疏注意力**，每层通过 `compress_ratio` 定�
 │  full_to_swa_index_mapping: Tensor   ← full pool loc → swa pool loc 地址翻译        │
 │  compression_ratios: [0,4,128,4,128,...] ← 每层的压缩类型                            │
 │  page_size = 256 (物理 page)                                                        │
-│  swa_page_size = 256 (= page_size, 内含 2 个 128-token FlashMLA attention page)     │
+│  swa_page_size = 256 (= page_size, FlashMLA 把每个 physical page 作为一个 block)  │
 │                                                                                     │
 │  ┌───────────────────────────────────────────────────────────────────────────────┐  │
 │  │                     KV 数据存储池 (所有层共享地址空间)                           │  │
