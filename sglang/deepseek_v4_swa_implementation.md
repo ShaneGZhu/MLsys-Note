@@ -175,13 +175,14 @@ req_to_token_pool (per-request 全局 token 地址)
 │ c4_kv_pool          │ F / 4                                  │
 │ c128_kv_pool        │ F / 128                                │
 │ c4_indexer_kv_pool  │ F / 4   (= c128_size × 32)            │
-│ c4_state_pool       │ (F×0.1 / 256) × 8                     │
-│ c128_state_pool     │ (F×0.1 / 256) × 128  (普通)            │
-│ c128_state_pool     │ (F×0.1 / 256) × 1    (online)         │
+│ c4_state_pool       │ (F×0.1 / 128) × 8                     │
+│ c128_state_pool     │ (F×0.1 / 128) × 128  (普通)            │
+│ c128_state_pool     │ (F×0.1 / 128) × 1    (online)         │
 └─────────────────────┴────────────────────────────────────────┘
 
-注: state_pool size = swa_tokens / swa_page_size × ring_size
-    swa_page_size = 256 (物理页); swa_tokens = F × 0.1
+注: state_pool 分配大小中的 "128" = cfg.window_size (pool_configurator.py:330)
+    运行时 CompressStatePool 用 swa_page_size=256 (物理页) 寻址
+    结果: 分配量约为实际最大使用量的 2×, 保证对齐安全
 ```
 
 配置来源：`python/sglang/srt/configs/deepseek_v4.py`
@@ -303,8 +304,8 @@ full_token = N (基准, 由 available_bytes / bytes_per_full_token 得出)
   ├── swa_tokens       = N × 0.1              ← swa_full_tokens_ratio
   ├── c4_tokens        = N / 4                ← compress_ratio=4
   ├── c128_tokens      = N / 128              ← compress_ratio=128
-  ├── c4_state_slots   = (N×0.1/128) × 8     ← swa_pages × ring_size
-  └── c128_state_slots = (N×0.1/128) × 128   ← swa_pages × ring_size
+  ├── c4_state_slots   = (N×0.1/128) × 8     ← swa_pages(按window_size) × ring_size
+  └── c128_state_slots = (N×0.1/128) × 128   ← swa_pages(按window_size) × ring_size
 ```
 
 比例来源：
@@ -450,13 +451,18 @@ alloc_extend(prefix_lens, seq_lens, last_loc, extend_num_tokens):
 SWA page_size=256，每个 page 内 256 个 slot **全部会被写满**：
 
 ```
-┌──────────────────────── 一个 SWA page (256 slots) ────────────────────────────┐
-│ slot[0] │ slot[1] │ ... │ slot[127] │ slot[128] │ ... │ slot[255]            │
-│◄────── FlashMLA logical page 0 ──────►│◄────── FlashMLA logical page 1 ────►│
-│          128 tokens (attention page)   │          128 tokens                  │
-└───────────────────────────────────────────────────────────────────────────────┘
+┌──────────────────────── 一个 SWA page (256 slots) ───────────────────────────────┐
+│ slot[0] │ slot[1] │ ... │ slot[127] │ slot[128] │ ... │ slot[255]                │
+│◄──────────────── FlashMLA 1 个 block (256 tokens) ──────────────────────────────►│
+└──────────────────────────────────────────────────────────────────────────────────┘
 
 每个 slot 存 584 bytes: FP8_nope(448B) + BF16_rope(128B) + scales(8B)
+
+注意: SWA window = 128 tokens 是注意力窗口大小 (query 最多 attend 128 个 token),
+     page_size = 256 是内存分配粒度。两者是不同层面的概念:
+     - 一个 query 的 swa_page_indices 只有 128 个 token 地址 (窗口大小)
+     - 这 128 个 token 可能散布在 1~2 个物理 page 中 (跨页边界时)
+     - FlashMLA 用 indices gather 模式, 不要求 token 在同一个 page 内连续
 ```
 
 token 逐个写入：每生成一个 token → `fused_qk_norm_rope_swa_store` 写入 `swa_kv_pool[swa_loc]`。
@@ -1617,11 +1623,15 @@ c128_online per layer:     [num_swa_pages × 1, 1536]   (FP32)
 
 ### 8.6 Ring 在 SWA Page 内的循环覆写
 
-以 c4 `ring_size=8`, `swa_page_size=128` 为例：
+以 c4 `ring_size=8`, 运行时 `CompressStatePool.swa_page_size=256` 为例：
 
 ```
-SWA page (128 tokens) → 只有 8 个 state slot
-→ ring 在一个 page 内循环 128/8 = 16 圈
+SWA page (256 tokens) → 只有 8 个 state slot
+→ ring 在一个 page 内循环 256/8 = 32 圈
+
+寻址公式 (deepseek_v4_compress_state.py:138-139):
+  swa_pages = swa_loc // 256
+  state_loc = swa_pages * ring_size + (swa_loc % ring_size)
 
 swa_loc (页内偏移)  →  swa_loc % 8  →  state slot
 ────────────────────────────────────────────────
@@ -1631,8 +1641,13 @@ swa_loc (页内偏移)  →  swa_loc % 8  →  state slot
 7                       7               slot 7
 8                       0               slot 0  ← 覆写
 ...
-127                     7               slot 7
+255                     7               slot 7
 ```
+
+> **注意 `swa_page_size` 的两处不同含义**：
+> - `DSV4PoolConfigurator.swa_page_size = cfg.window_size = 128` → 用于**计算总分配量**
+> - `CompressStatePool.swa_page_size = page_size = 256` → 用于**运行时地址映射**
+> - 分配按 128 算, 使用按 256 算, 结果是分配量约 2× 实际最大使用 (保守安全)
 
 **为什么覆写是安全的**：
 
@@ -1671,10 +1686,16 @@ c128_state_pool_size = swa_tokens // self.swa_page_size * self.c128_ring_size
 
 ```
 swa_tokens = 10,000
-num_swa_pages = 10,000 / 128 = 78
 
-每个 c4 层:  78 rings × 8 slots/ring  = 624 state slots
-每个 c128 层: 78 rings × 128 slots/ring = 9,984 state slots
+State pool 分配 (pool_configurator, swa_page_size=window_size=128):
+  num_logical_pages = 10,000 / 128 = 78
+  每个 c4 层:  78 × 8 = 624 state slots (分配量)
+  每个 c128 层: 78 × 128 = 9,984 state slots (分配量)
+
+运行时寻址 (CompressStatePool, swa_page_size=256):
+  num_physical_pages = 10,000 / 256 = 39
+  实际最大使用: c4 = 39 × 8 = 312, c128 = 39 × 128 = 4,992
+  → 分配量 ≈ 2× 实际使用量 (保守分配)
 ```
 
 ### 8.8 State Ring Buffer 与 Prefix Caching 的适配
