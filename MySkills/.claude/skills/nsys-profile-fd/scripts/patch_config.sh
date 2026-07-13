@@ -21,8 +21,17 @@ if [ ! -f "$FILE" ]; then
     exit 1
 fi
 
+# Validate KEY: only allow alphanumeric chars and underscores
+if ! echo "$KEY" | grep -qE '^[A-Za-z_][A-Za-z0-9_]*$'; then
+    echo "错误: key 只允许字母、数字和下划线: $KEY" >&2
+    exit 1
+fi
+
+# Escape sed special characters in VAL (/, &, \)
+ESCAPED_VAL=$(printf '%s' "$VAL" | sed 's/[\/&\\]/\\&/g')
+
 # 替换 JSON 字段值（匹配 "key": 任意值，直到逗号或右花括号前）
-sed -i "s/\"${KEY}\":[[:space:]]*[^,}]*/\"${KEY}\":${VAL}/" "$FILE"
+sed -i "s/\"${KEY}\":[[:space:]]*[^,}]*/\"${KEY}\":${ESCAPED_VAL}/" "$FILE"
 
 # 验证替换结果
 RESULT=$(grep "\"${KEY}\"" "$FILE")

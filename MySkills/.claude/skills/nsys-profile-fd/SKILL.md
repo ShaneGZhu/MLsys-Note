@@ -28,7 +28,7 @@ report_dir    = /root/paddlejob/workspace/env_run/output/zhushengguang/jobspace/
 report_prefix = dsv32_5layer_cudagraph
 param_key     = use_cudagraph
 param_vals    = false,true
-wait_ip       = 10.95.239.139
+wait_ip       = <INTERNAL_IP>
 wait_port     = 8291
 nsys_session  = zsg
 ```

@@ -14,3 +14,17 @@ CUDA-Learn/cg_demo
 *.fatbin
 *.cubin
 *.ptx
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Secrets and environment files
+.env
+.env.*
+!.env.example
+
+# Editor/IDE files
+*.swp
+*.swo
+*~
