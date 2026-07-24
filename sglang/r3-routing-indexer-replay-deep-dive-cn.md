@@ -1,4 +1,4 @@
-# R3 Routing / Indexer Replay 深入解析（面向 RL 接入与维护）
+****# R3 Routing / Indexer Replay 深入解析（面向 RL 接入与维护）
 
 > 基线：当前仓库 `internal/release/1.0.0`，提交 `bcc27e770f5b61e557de57b45679dedceee219a7`（2026-07-10）。本文行号均按该提交核对。
 >
@@ -394,6 +394,53 @@ flowchart LR
 **【源码确认】** 每个满足 `pp_rank==0 && attn_tp_rank==0` 的 Scheduler 都独立创建 `StoreWrapper`，而每个 wrapper 创建 `multiprocessing.Manager().Queue` proxy、monitor thread 与自己的 `StoreProcess`（`python/sglang/srt/managers/scheduler.py:586-602`；`python/sglang/srt/internal/r3_plugin/routing_store.py:91-134,162-190`）。`Manager` 本身有独立 server 进程；因此在 DP attention 或多副本部署中可能存在多个 qualifying owner/store process，并非部署级单例。队列容量公式是 `num_moe_layers * max_num_seqs * 1000`（`routing_store.py:105-108`）。R3 key/path 不自动加入 DP rank，训练侧必须保证这些 producer 之间 RID 全局唯一，或明确设计其聚合/分片规则。
 
 **【源码确认】** 子进程内是 5-worker thread pool + 独立 asyncio event loop thread；task 支持 `put`、`clear_store`、`clear_prefix_batch`（同文件 `:404-462,569-621`）。padding 在子进程 `process_put_task()` 内完成（同文件 `:464-481`）。
+
+ StoreProcess 的作用
+                                                                                                       
+  位于 python/sglang/srt/internal/r3_plugin/routing_store.py:408，它是 R3（Routing                
+  Replay）插件里一个独立的后台进程，专门用来把 MoE routing / indexer                                   
+  数据异步写到存储后端，避免阻塞主推理进程。                                                           
+                                                                                                       
+  在整体架构中的位置                                                                                   
+                                                                                                   
+  主进程通过 StoreWrapper（routing_store.py:91）持有一个 multiprocessing.Manager().Queue()，把要落盘/落
+   RDMA 的任务塞进去；StoreProcess 作为子进程从队列拉任务并执行。数据流大致：
+
+  Scheduler/主进程 请求完成
+      → StoreWrapper.process_finished_requests()   (routing_store.py:282)
+      → 把 routing/indexer numpy 数据封成 StoreTask
+      → 塞进 multiprocessing Queue
+      ─────────── 进程边界 ───────────
+      → StoreProcess.run()                          (routing_store.py:431)
+      → ThreadPoolExecutor(max_workers=5)
+      → RoutingStoreLocal / RoutingStoreRDMA (p2pstore)
+
+  具体职责（routing_store.py:408-570）
+
+  1. 子进程隔离 — 继承 multiprocessing.Process，run() 在独立进程中执行。这样 pad、序列化、RDMA/磁盘 IO
+  都不会占用推理进程的 GIL 和 CPU。
+  2. 懒初始化存储后端 — 在 run() 里才调用 get_routing_store()（routing_store.py:434）创建
+  RoutingStoreLocal 或 RoutingStoreRDMA。因为 RDMA 的 P2PClient 有 fork 安全问题，必须在子进程内构造。
+  3. 异步事件循环 — 内部再起一个 AsyncEventLoopThread（routing_store.py:438,573），把 RoutingStoreBase
+  那些 async def put/clear 协程用 run_coroutine_threadsafe 提交到该 loop。
+  4. 多线程消费 — 主循环用
+  ThreadPoolExecutor(max_workers=5)（routing_store.py:443）从队列拉任务并派发到 3 类处理函数：
+    - process_put_task         — 存 routing/indexer 索引（routing_store.py:468）
+    - process_clear_store_task — 清空整个 store（routing_store.py:491）
+    - process_clear_prefix_batch_task — 按前缀清除，用于多轮对话回收上一轮（routing_store.py:505）
+    - 收到 None sentinel 时优雅退出（routing_store.py:447）
+  5. 数据后处理 — pad_routing_indices()（routing_store.py:539）按 max_model_len 做 padding；unsigned
+  dtype 用 iinfo.max 作为 fill，int 用 -1。是否 pad 由 routing_no_pad / indexer_no_pad 控制。
+
+  为什么单独开进程而不是线程
+
+  - Routing 索引数据量可能很大（queue_max_size = num_moe_layers * max_num_seqs * 1000，见
+  routing_store.py:108），持续 IO 会抢主进程 CPU。
+  - RDMA 的 p2pstore.P2PClient 需要在 fork 之后的干净进程里初始化。
+  - Python GIL 下，纯线程做序列化 + torch.save 会明显拖慢调度线程。
+
+  一句话总结：StoreProcess 是 R3 replay 数据落地的后台工作进程，从主进程接收 routing/indexer
+  数据任务队列，异步落到本地文件系统或 RDMA p2pstore，用于 RLHF 场景下重放路由决策。
 
 ### 9.2 并发与完成语义风险
 

@@ -1511,3 +1511,55 @@ tuple[
 9. 最后读 `routing_store.py` 的两处改动 —— 小的运行期改进。
 10. 参照测试 `test_r3_multi_cache_unittest.py` 反向验证理解。
 
+
+# 疑问
+## 为什么mooncake需要先注册，然后执行远端落成key->bytes，而不是直接从buffer落成远端的key->bytes
+
+
+RDMA NIC 要 DMA 一段 host 内存，必须先满足两条：
+
+1. **页锁定（pin）**：内存不能被内核换出/迁移。RDMA 用物理地址传输，一旦 page fault / migrate，硬件访问的就是坏地址。
+2. **地址翻译表登记**：把 `(虚拟地址范围, 物理页, 访问权限)` 灌到 NIC 的 MR（Memory Region）表，拿到 `lkey/rkey`。之后 SEND/RECV/READ/WRITE Work Request 里用这个 key 引用内存。
+
+`register_buffer(ptr, size)` 干的就是这两件事：调 `ibv_reg_mr` 或等价 API，让 kernel 把这段 host 内存 pin 住 + 把 (ptr, size, key) 塞进 NIC。没走这步的内存，NIC 看不见，也不敢访问。
+
+所以 Mooncake 的设计是：**慢路径（一次性）**：预注册整块 host 池 → **快路径（每次）**：只传 `(key, ptr, size)`，NIC 直接从预注册区读走。这就是 `batch_put_from` 的 "zero-copy" 之意。
+
+**顺便回一下"为什么不能远端注册"**
+RDMA WRITE/READ 两端都要注册：本端 pin 是给 NIC 从这里搬字节用的，远端 pin 是给 NIC 往那里写字节用的。Mooncake master 端在 store 服务里也有它自己的一大块预注册内存（segment），SGLang 端只管本地这一块。两边都注册好，NIC 才能对拷。
+
+## Mooncake的架构
+ **四类角色**
+
+| 角色                           | 进程/命令                                                                                                                                                                                                                                      | 默认端口         | 作用                                                                                                                                            |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Master service**（元数据主节点）   | `mooncake_master`                                                                                                                                                                                                                          | 50051 (gRPC) | 全局 key→(segment_id, offset) 的**元数据服务**；管 segment 注册、心跳、eviction、租约。**不存数据字节**。                                                                |
+| **Metadata service**（握手元数据）  | `python -m mooncake.http_metadata_server`                                                                                                                                                                                                  | 8080 (HTTP)  | Transfer Engine 建立 RDMA 连接时用的握手层：交换 QP/GID/rkey 等 endpoint 信息。可用 `P2PHANDSHAKE` 模式内建对等握手，绕过它。                                                 |
+| **Store service**（存储节点）      | 独立的 store 进程（[README.md:147-153](https://webview-1udok55ogqp2iguoiobuhnn9i0ssntb2p0955tmdnb7922vsrc8u.icoding.baidu-int.com/icoding/webview/comate/stable/1.105.0/python/sglang/srt/mem_cache/storage/mooncake_store/README.md#L147-L153)） | —            | 真正**持有数据字节**的地方。启动时把 `MOONCAKE_GLOBAL_SEGMENT_SIZE` 大的一块本地内存 pin 住 + 注册到 NIC，作为一个 **segment** 汇报给 master。集群总容量 = 所有 store service segment 之和。 |
+| **Client**（这里就是 SGLang 推理进程） | SGLang 里的 `MooncakeDistributedStore`                                                                                                                                                                                                       | —            | 发起 put/get 的一端，本地也要 `register_buffer(ptr,size)` 把 host 的 KV/routing buffer 注册到 NIC。                                                           |
+**数据/控制平面拆分**
+```
+             ┌──────── control plane (gRPC/HTTP) ────────┐
+             ▼                                            ▼
+    ┌────────────────┐                          ┌────────────────┐
+    │ Master service │  key→segment 元数据       │ Metadata svc   │
+    │ :50051         │                          │ :8080          │
+    └────────┬───────┘                          └────────┬───────┘
+             ▲                                            ▲
+             │ segment register / lookup                  │ RDMA endpoint 握手
+             │                                            │
+    ┌────────┴───────┐          RDMA WRITE      ┌─────────┴──────┐
+    │ Client         │ ──────────────────────▶  │ Store service  │
+    │ (SGLang proc)  │  data plane (zero-copy)  │ (segment 内存) │
+    │ 本地 buffer    │ ◀──────────────────────  │ 别人 segment   │
+    │ 已 register    │          RDMA READ       │ 已 register    │
+    └────────────────┘                          └────────────────┘
+```
+
+一次 `store.put(key, ptr, size)` 大致发生的事：
+
+1. Client 问 master：给我一个能放 `size` 字节的位置 → master 返回 `(segment_id, remote_addr, rkey)`。
+2. Client 端 Transfer Engine 触发 **RDMA WRITE**：从本地 pin 好的 `ptr` 直接写到 store service 那块 pin 好的 segment 的 `remote_addr`。
+3. 完成后 client 告诉 master "key 落盘"，master 记录 `key → (segment_id, offset, size)`。
+
+get 反向：master 查表 → client 发 RDMA READ 从 remote segment 读回本地 buffer。数据面**完全不经过 master**，master 只做元数据。
