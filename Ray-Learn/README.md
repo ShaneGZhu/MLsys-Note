@@ -147,23 +147,38 @@ ray.init(resources={"fake_gpu": 4})
 
 ## 三、怎么跑一课
 
-每课的代码块是完整的单文件脚本，直接存下来跑：
-
 ```bash
 cd ~/Documents/MLsys-Note/Ray-Learn
-mkdir -p lessons
-# 把 L01 的代码块存成 lessons/01_actor_model.py，然后：
-uv run python lessons/01_actor_model.py
+uv run python lessons/py/02a_ledger.py
 ```
 
-或者不建文件，直接贴进 `uv run python`（REPL）：
+### ⚠️ 代码有两份，以 `py/` 为准
 
-```bash
-uv run python
 ```
+lessons/
+├── 01-actor-model.md        ← 讲义：原理 / 预测 / 期望输出 / 为什么 Lux 关心
+├── ...
+└── py/
+    ├── 01_actor_model.py    ← ⭐ 可运行脚本 = 唯一真相源
+    ├── 02a_ledger.py
+    ├── 02a_actor_trap.py
+    └── ...
+```
+
+| | 作用 | 改了谁 |
+| --- | --- | --- |
+| `py/*.py` | **能直接跑的东西**，是本课的真相源 | 改代码**只改这里**，然后把改动回填到 md |
+| `*.md` 里的代码块 | 与 `py/` **同步维护**的副本，让讲义能独立阅读 | 不要单独改——那会分叉 |
+
+> ⚠️ **两份代码一定会漂移，这是这个结构的固有代价。**
+> 约定是"改 `py/` → 回填 md"，而不是反过来。
+> 如果你只想要一份：把 md 里的代码块删成关键片段 + 指向文件（这会更安全，但讲义不能独立读了）。
 
 > ⚠️ **每个脚本结尾都调了 `ray.shutdown()`**。忘记 shutdown 会让下一个脚本连到上一个的集群，
 > 出现"资源怎么少了"这类幻觉。
+
+> ⚠️ **脚本可能挂住而不是报错**——这是 Ray 的常态（[L02](lessons/02-resource-ledger.md) A2 就是这个主题）。
+> 卡住时 `Ctrl-C`，然后 `ray stop` 清干净再来。**不要把"没输出"当成"没问题"。**
 
 ### 实验记录建议
 

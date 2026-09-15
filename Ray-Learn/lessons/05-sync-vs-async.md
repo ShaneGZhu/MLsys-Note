@@ -25,10 +25,13 @@
 
 ## ③ 完整代码
 
-存成 `lessons/05_sync_vs_async.py`：
+存成 `lessons/py/05_sync_vs_async.py` —— 📄 **可运行版本就在该文件里，⭐ 以它为准**（本文下面的代码块与它同步维护；改代码请改 `py/`，再回填这里）：
 
 ```python
-"""L05 · 饿死实验：为什么阻塞一个 actor 会拖死它的全部调用。"""
+"""L05 · 饿死实验：为什么阻塞一个 actor 会拖死它的全部调用。
+
+⚠️ 不需要 GPU —— 笔记本上也能完整跑完。
+"""
 import asyncio
 import time
 import ray
@@ -72,12 +75,12 @@ class AsyncBlocking:
 
 def measure(actor, label: str) -> None:
     """提交一个长时间阻塞的调用，然后立刻测 ping 的延迟。"""
-    ref_block = actor.blocking.remote(BLOCK_SECONDS)   # 不等待
-    time.sleep(SETTLE)                                  # 等它跑起来
+    ref_block = actor.blocking.remote(BLOCK_SECONDS)   # 不等待，只提交
+    time.sleep(SETTLE)                                  # 等它真的跑起来
     t0 = time.time()
-    result = ray.get(actor.ping.remote())
+    ray.get(actor.ping.remote())
     latency = time.time() - t0
-    ray.get(ref_block)                                  # 收尾
+    ray.get(ref_block)                                  # 收尾，确保下次测量干净
     flag = "✅ 立刻返回" if latency < 0.5 else "❌ 被饿死了"
     print(f"  {label:<34} ping 延迟 = {latency:5.2f}s   {flag}")
 
@@ -89,10 +92,8 @@ def main() -> None:
     measure(SyncActor.remote(), "A 同步 actor")
     measure(AsyncYielding.remote(), "B 异步 + await（让出）")
     measure(AsyncBlocking.remote(), "C 异步 + time.sleep（真阻塞）")
-    measure(
-        AsyncBlocking.options(max_concurrency=10).remote(),
-        "D 同 C，但 max_concurrency=10",
-    )
+    measure(AsyncBlocking.options(max_concurrency=10).remote(),
+            "D 同 C，但 max_concurrency=10")
 
     print("\n👉 结论：C 和 D 一样地慢 —— max_concurrency 只是让【协程】交错，")
     print("   而一个卡在 C 调用里的协程永远不会 yield。")
@@ -105,7 +106,7 @@ if __name__ == "__main__":
 ```
 
 ```bash
-uv run python lessons/05_sync_vs_async.py
+uv run python lessons/py/05_sync_vs_async.py
 ```
 
 ## ④ 你应该观察到什么

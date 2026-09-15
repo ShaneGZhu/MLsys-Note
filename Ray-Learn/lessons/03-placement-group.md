@@ -18,10 +18,11 @@
 
 ## ③ 完整代码
 
-存成 `lessons/03_placement_group.py`：
+存成 `lessons/py/03_placement_group.py` —— 📄 **可运行版本就在该文件里，⭐ 以它为准**（本文下面的代码块与它同步维护；改代码请改 `py/`，再回填这里）：
 
 ```python
 """L03 · Placement Group：gang scheduling 与 bundle 绑定。"""
+import os
 import ray
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
@@ -35,16 +36,26 @@ class TrainActor:
         self.rank = rank
 
     def where(self) -> dict:
-        import os
         ctx = ray.get_runtime_context()
+        # ⚠️ get_placement_group_bundle_index() 不是每个 Ray 版本都有 ——
+        #    用 getattr 探测，缺了就打 "?"，不要因为这个 AttributeError 让整课跑不起来。
+        get_bundle = getattr(ctx, "get_placement_group_bundle_index", None)
         return {
             "rank": self.rank,
             "gpu": os.environ.get("CUDA_VISIBLE_DEVICES", "?"),
-            "node_id": ctx.get_node_id()[:8],
             "node_ip": ray.util.get_node_ip_address(),
             "pg_id": str(ctx.get_placement_group_id())[:8],
-            "bundle": ctx.get_placement_group_bundle_index(),
+            "bundle": get_bundle() if callable(get_bundle) else "?",
         }
+
+
+def make_actor(pg, rank: int):
+    return TrainActor.options(
+        scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=pg,
+            placement_group_bundle_index=rank,        # ⭐ 这一行决定「位置」
+        )
+    ).remote(rank=rank)
 
 
 def main() -> None:
@@ -57,7 +68,7 @@ def main() -> None:
                              strategy="STRICT_PACK", name="too_big")
     try:
         ray.get(pg_big.ready(), timeout=8)
-        print("  ⚠️ 竟然 ready 了 —— 与预期不符，见下方排查")
+        print("  ⚠️ 竟然 ready 了 —— 与预期不符，见 md 的排查表")
     except ray.exceptions.GetTimeoutError:
         print("  ✅ 8 秒内没有 ready：**PG 是 all-or-nothing，不给你一部分**")
     ray.util.remove_placement_group(pg_big)
@@ -69,28 +80,24 @@ def main() -> None:
     ray.get(pg.ready())
     print(f"  ✅ ready。pg={str(pg.id)[:8]}  bundle 数={len(pg.bundle_specs)}")
 
-    # ── 实验 3：bundle_index 决定 actor 落在哪 ────────────────────
-    print("\n[实验 3] 4 个 TrainActor 分别绑到 bundle 0/1/2/3")
-    def make(rank: int):
-        return TrainActor.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_bundle_index=rank,    # ⭐ 这一行决定"位置"
-            )
-        ).remote(rank=rank)
+    # ── 实验 3 / 4：同样的绑定跑两轮，位置必须一致 ───────────────
+    rows = []
+    for rnd in (3, 4):
+        print(f"\n[实验 {rnd}] 4 个 TrainActor 绑到 bundle 0/1/2/3"
+              f"{'（再跑一轮，用于比对）' if rnd == 4 else ''}")
+        info = ray.get([make_actor(pg, i).where.remote() for i in range(4)])
+        info.sort(key=lambda d: d["rank"])
+        for d in info:
+            print(f"  rank={d['rank']}  bundle={d['bundle']}  gpu={d['gpu']}  "
+                  f"node={d['node_ip']}  pg={d['pg_id']}")
+        rows.append([(d["rank"], d["gpu"]) for d in info])
 
-    for info in ray.get([make(i).where.remote() for i in range(4)]):
-        print(f"  rank={info['rank']}  bundle={info['bundle']}  "
-              f"gpu={info['gpu']}  node={info['node_ip']}  pg={info['pg_id']}")
-
-    # ── 实验 4：同样的绑定再起一轮，位置必须可复现 ────────────────
-    print("\n[实验 4] 再起一轮，位置应当【完全一致】")
-    for info in ray.get([make(i).where.remote() for i in range(4)]):
-        print(f"  rank={info['rank']}  bundle={info['bundle']}  "
-              f"gpu={info['gpu']}  node={info['node_ip']}  pg={info['pg_id']}")
-
-    print("\n👉 实验 3 与 4 的 (rank → gpu) 必须逐行相同。")
-    print("   若不同，就必须做 bundle 重排序（见 §⑤）。")
+    print()
+    if rows[0] == rows[1]:
+        print("✅ 两轮的 (rank → gpu) 完全一致 —— 绑定是稳定的")
+    else:
+        print(f"❌ 两轮不一致：\n   第一轮 {rows[0]}\n   第二轮 {rows[1]}")
+        print("   ⇒ 必须做 bundle 重排序（见 md §⑤）")
 
     ray.shutdown()
 
@@ -100,7 +107,7 @@ if __name__ == "__main__":
 ```
 
 ```bash
-uv run python lessons/03_placement_group.py
+uv run python lessons/py/03_placement_group.py
 ```
 
 ## ④ 你应该观察到什么
@@ -114,15 +121,19 @@ uv run python lessons/03_placement_group.py
 [实验 2] 申请 4 个 bundle（机器有 8 张）
   ✅ ready。pg=xxxxxxxx  bundle 数=4
 
-[实验 3] 4 个 TrainActor 分别绑到 bundle 0/1/2/3
+[实验 3] 4 个 TrainActor 绑到 bundle 0/1/2/3
   rank=0  bundle=0  gpu=0  node=10.0.0.11  pg=xxxxxxxx
   rank=1  bundle=1  gpu=1  node=10.0.0.11  pg=xxxxxxxx
   rank=2  bundle=2  gpu=2  node=10.0.0.11  pg=xxxxxxxx
   rank=3  bundle=3  gpu=3  node=10.0.0.11  pg=xxxxxxxx
 
-[实验 4] 再起一轮，位置应当【完全一致】
-  rank=0  bundle=0  gpu=0  node=10.0.0.11  pg=xxxxxxxx
-  ...（同上）
+[实验 4] 4 个 TrainActor 绑到 bundle 0/1/2/3（再跑一轮，用于比对）
+  ...（同上，必须逐行相同）
+
+✅ 两轮的 (rank → gpu) 完全一致 —— 绑定是稳定的
+
+⚠️ 若 bundle= 显示为 "?"，说明你的 Ray 版本没有
+   get_placement_group_bundle_index()——不影响结论，看 gpu= 那一列即可。
 ```
 
 ### ⚠️ 单机能观察什么、不能观察什么

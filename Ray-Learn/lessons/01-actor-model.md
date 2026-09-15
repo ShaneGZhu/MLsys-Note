@@ -23,7 +23,7 @@ C. 不确定
 
 ## ③ 完整代码
 
-存成 `lessons/01_actor_model.py`：
+存成 `lessons/py/01_actor_model.py` —— 📄 **可运行版本就在该文件里，⭐ 以它为准**（本文下面的代码块与它同步维护；改代码请改 `py/`，再回填这里）：
 
 ```python
 """L01 · task 与 actor。"""
@@ -101,7 +101,7 @@ if __name__ == "__main__":
 ```
 
 ```bash
-uv run python lessons/01_actor_model.py
+uv run python lessons/py/01_actor_model.py
 ```
 
 ## ④ 你应该观察到什么

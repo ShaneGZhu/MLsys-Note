@@ -31,23 +31,27 @@
 
 ## ③ Part A1 · task：超额会**排队**，最终跑完
 
-存成 `lessons/02a_ledger.py`：
+存成 `lessons/py/02a_ledger.py` —— 📄 **可运行版本就在该文件里，⭐ 以它为准**（本文下面的代码块与它同步维护；改代码请改 `py/`，再回填这里）：
 
 ```python
-"""L02 Part A · 资源账本：task 会排队。"""
+"""L02 Part A1 · 资源账本：task 会排队（跑完就释放）。
+
+⚠️ 对比 02a_actor_trap.py：把 task 换成 actor，第 9 个就【永远不会跑】。
+"""
 import os
 import time
 import ray
 
-T0 = time.time()
 
-
-# ⭐ 注意这里是 task（函数），不是 actor（类）
+# ⭐ 这是 task（函数），不是 actor（类）
 @ray.remote(num_gpus=1, num_cpus=1)
-def hold(name: str, seconds: float) -> tuple[str, str, float]:
+def hold(name: str, seconds: float, t0: float) -> tuple[str, str, float]:
+    # ⚠️ t0 必须【显式传进来】：remote 函数跑在别的进程里，模块级全局变量
+    #    靠 cloudpickle 按值捕获 —— 能work但很容易写错（初版就是这么挂的）。
+    #    规则：remote 函数里要用什么，就传什么。
     gpu = os.environ.get("CUDA_VISIBLE_DEVICES", "?")
     time.sleep(seconds)
-    return name, gpu, round(time.time() - T0, 2)
+    return name, gpu, round(time.time() - t0, 2)
 
 
 def main() -> None:
@@ -58,8 +62,8 @@ def main() -> None:
     print("可用 GPU:", ray.available_resources().get("GPU"))
     print()
 
-    # 提交 9 个 task，账上只有 8 张卡
-    refs = [hold.remote(f"t{i}", 2.0) for i in range(9)]
+    t0 = time.time()
+    refs = [hold.remote(f"t{i}", 2.0, t0) for i in range(9)]
     time.sleep(1)
     print("已提交 9 个 task（各要 1 张卡），账上只有 8 张")
     print(f"此刻 available GPU = {ray.available_resources().get('GPU')}")
@@ -80,7 +84,7 @@ if __name__ == "__main__":
 ```
 
 ```bash
-uv run python lessons/02a_ledger.py
+uv run python lessons/py/02a_ledger.py
 ```
 
 ### 期望输出
@@ -108,15 +112,18 @@ uv run python lessons/02a_ledger.py
 
 把上面的 `hold` **改成 `Holder` 类**（actor），其余不变，第 9 个就**永远不会跑**。
 
-存成 `lessons/02a_actor_trap.py`：
+存成 `lessons/py/02a_actor_trap.py` —— 📄 **可运行版本就在该文件里，⭐ 以它为准**（本文下面的代码块与它同步维护；改代码请改 `py/`，再回填这里）：
 
 ```python
-"""L02 Part A2 · ⚠️ actor 超额的后果：永久挂死。"""
+"""L02 Part A2 · ⚠️ actor 超额的后果：永久挂死（不是排队）。
+
+初版这一课用 actor 演示「超额会排队」—— 那是错的，脚本会一直不返回。
+原因：actor 在【创建时】就占住 num_gpus，并持有到它【整个生命周期】结束；
+不是每次方法调用占一下。所以第 9 个 actor 根本不会被创建。
+"""
 import os
 import time
 import ray
-
-T0 = time.time()
 
 
 @ray.remote(num_gpus=1, num_cpus=1)
@@ -124,39 +131,44 @@ class Holder:
     def __init__(self, name: str):
         self.name = name
 
-    def work(self, seconds: float) -> tuple[str, str, float]:
+    def work(self, seconds: float, t0: float) -> tuple[str, str, float]:
         return (self.name,
                 os.environ.get("CUDA_VISIBLE_DEVICES", "?"),
-                round(time.time() - T0, 2))
+                round(time.time() - t0, 2))
 
 
 def main() -> None:
     ray.init()
     print("账本 GPU:", ray.cluster_resources().get("GPU"))
 
-    # 创建 9 个 actor，但只有 8 张卡
-    holders = [Holder.remote(f"a{i}") for i in range(9)]
+    t0 = time.time()
+    n = 9
+    holders = [Holder.remote(f"a{i}") for i in range(n)]
     time.sleep(2)                       # 给调度器一点时间
-    print(f"已请求 9 个 actor；此刻 available GPU = "
+    print(f"已请求 {n} 个 actor；此刻 available GPU = "
           f"{ray.available_resources().get('GPU')}")
     print("⚠️ 没有报错，也没有 warning 说你资源不够\n")
 
-    # ── 前 8 个正常 ──────────────────────────────────────────────
-    got = ray.get([h.work.remote(0.1) for h in holders[:8]])
-    print(f"前 8 个正常返回: {[g[0] for g in got]}")
+    # ⚠️ 不能假设"前 8 个就是被创建的那些"—— 被创建的是哪 8 个没有保证。
+    #    所以用 ray.wait 而不是 ray.get：它把【就绪的】和【一直没就绪的】分开返回，
+    #    不会因为其中一个永远不就绪而把整个脚本挂住。
+    refs = [h.work.remote(0.1, t0) for h in holders]
+    ready, pending = ray.wait(refs, num_returns=n, timeout=5)
 
-    # ── 第 9 个：用 timeout 安全地证明"它永远不会来" ─────────────
-    print("\n第 9 个 actor 呢？我们给它 5 秒：")
-    try:
-        r = ray.get(holders[8].work.remote(0.1), timeout=5)
-        print(f"  ⚠️ 竟然返回了: {r} —— 与预期不符，见下方排查")
-    except ray.exceptions.GetTimeoutError:
-        print("  ✅ 5 秒超时。**第 9 个 actor 根本没有被创建** ——")
-        print("     它没有崩溃，它在等一张【永远不会空出来】的卡。")
+    done = sorted(refs.index(r) for r in ready)
+    stuck = sorted(refs.index(r) for r in pending)
+    print(f"5 秒内返回的 actor: {['a%d' % i for i in done]}")
+    print(f"一直没返回的 actor: {['a%d' % i for i in stuck]}")
 
-    print("\n⚠️ 关键：actor 在【创建时】就占住 num_gpus，并持有到它【整个生命周期】结束。")
-    print("   不是每次方法调用占一下 —— 所以它不会像 task 那样跑完就释放。")
+    if stuck:
+        print(f"\n  ✅ a{stuck[0]} 根本没有被【创建】—— 它没有崩溃，")
+        print("     它在等一张【永远不会空出来】的卡。")
+    else:
+        print("\n  ⚠️ 9 个都跑起来了 —— 机器上其实有 ≥9 张卡，先 nvidia-smi -L 确认")
+
+    print("\n⚠️ 关键：actor 在创建时就占住 num_gpus，持有到整个生命周期结束。")
     print("   ⇒ actor 的超额 = 永久挂死；任何 ray.get 在它上面都会一直等下去。")
+    print("   ⇒ 这就是为什么不能用 ray.get 去探它 —— 必须用 ray.wait + timeout。")
 
     ray.shutdown()
 
@@ -166,7 +178,7 @@ if __name__ == "__main__":
 ```
 
 ```bash
-uv run python lessons/02a_actor_trap.py
+uv run python lessons/py/02a_actor_trap.py
 ```
 
 ### 期望输出
@@ -176,14 +188,15 @@ uv run python lessons/02a_actor_trap.py
 已请求 9 个 actor；此刻 available GPU = 0.0
 ⚠️ 没有报错，也没有 warning 说你资源不够
 
-前 8 个正常返回: ['a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7']
+5 秒内返回的 actor: ['a0', 'a1', 'a2', 'a3', 'a4', 'a5', 'a6', 'a7']
+一直没返回的 actor: ['a8']
 
-第 9 个 actor 呢？我们给它 5 秒：
-  ✅ 5 秒超时。**第 9 个 actor 根本没有被创建** ——
-     它没有崩溃，它在等一张【永远不会空出来】的卡。
+  ✅ a8 根本没有被【创建】—— 它没有崩溃，
+     它在等一张【永远不会空出来】的卡。
 
-⚠️ 关键：actor 在【创建时】就占住 num_gpus，并持有到它【整个生命周期】结束。
+⚠️ 关键：actor 在创建时就占住 num_gpus，持有到整个生命周期结束。
    ⇒ actor 的超额 = 永久挂死；任何 ray.get 在它上面都会一直等下去。
+   ⇒ 这就是为什么不能用 ray.get 去探它 —— 必须用 ray.wait + timeout。
 ```
 
 ### ⭐ task vs actor：一张表记住
@@ -246,27 +259,32 @@ ray start --head --num-gpus=8        # ⚠️ 报了全部 8 张，但 4 张已�
 **终端 C**：
 
 ```bash
-uv run python lessons/02b_occupancy.py --expect-fail
+uv run python lessons/py/02b_occupancy.py --expect-fail
 ```
 
-`lessons/02b_occupancy.py`：
+`lessons/py/02b_occupancy.py`：
 
 ```python
-"""L02 Part B · 账本 vs 实际占用。"""
+"""L02 Part B · 账本 vs 实际占用。
+
+⚠️ 用 task 而不是 actor：task 跑完就释放，所以 --num-gpus=4 那一轮不会挂住。
+⚠️ 字节数：dtype=torch.uint8 时【1 元素 = 1 字节】，所以 gib * 1024**3 就是 gib GiB。
+   初版写成 gib * 1024**3 // 4，实际只占了 1/4，实验会「看起来通过」而其实没验到东西。
+"""
 import os
 import sys
 import ray
 import torch
 
 
-# ⭐ 用 task 而不是 actor：task 跑完就释放，所以 --num-gpus=4 那一轮不会挂住
 @ray.remote(num_gpus=1, num_cpus=1)
 def probe(rank: int, gib: int = 20) -> str:
     cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "?")
     try:
-        _x = torch.zeros(gib * 1024**3 // 4, dtype=torch.uint8, device="cuda:0")
-        total = torch.cuda.get_device_properties(0).total_memory / 1024**3
-        return f"rank={rank} cvd={cvd} ✅ 占到 {gib}GB（卡共 {total:.0f}GB）"
+        n_bytes = gib * 1024 ** 3                 # uint8 -> 1 字节/元素
+        _x = torch.zeros(n_bytes, dtype=torch.uint8, device="cuda:0")
+        total = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+        return f"rank={rank} cvd={cvd} ✅ 占到 {gib}GiB（卡共 {total:.0f}GiB）"
     except torch.cuda.OutOfMemoryError as e:
         return f"rank={rank} cvd={cvd} ❌ OOM: {str(e)[:60]}"
 
@@ -285,8 +303,6 @@ def main() -> None:
     if expect_fail:
         print("👉 看 cvd=4/5/6/7 的：**Ray 把 task 放到了已被引擎占住的卡上**")
         print("   它们 OOM 就说明账本与物理现实不一致 —— 这正是要避免的。")
-        print("   ⚠️ 若没 OOM（70GB 占用 + 20GB 申请刚好挤下），")
-        print("      把占用调到 75GB 或申请调到 40GB 再试 —— 现象要能看见才算数。")
     else:
         print("👉 没有一个落到 4–7 上 = 账本与物理现实一致。")
 
@@ -300,7 +316,7 @@ if __name__ == "__main__":
 ```bash
 ray stop
 ray start --head --num-gpus=4        # ⭐ 只报没被占的那 4 张
-uv run python lessons/02b_occupancy.py
+uv run python lessons/py/02b_occupancy.py
 ```
 
 ### 期望对比

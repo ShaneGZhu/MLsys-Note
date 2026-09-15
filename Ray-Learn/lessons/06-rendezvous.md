@@ -21,7 +21,7 @@
 
 > 需要 torch：`uv sync --extra dist`
 
-存成 `lessons/06_rendezvous.py`：
+存成 `lessons/py/06_rendezvous.py` —— 📄 **可运行版本就在该文件里，⭐ 以它为准**（本文下面的代码块与它同步维护；改代码请改 `py/`，再回填这里）：
 
 ```python
 """L06 · 手工 rendezvous + NCCL 进程组（真卡）。"""
@@ -48,7 +48,7 @@ class TrainActor:
     """一个训练 rank。
 
     ⚠️ __init__ 里【不】调 init_process_group：那会阻塞到所有 rank 齐为止，
-    而 rank 0 还要先回答"我的地址和端口是什么"——顺序错了就死锁。
+    而 rank 0 还要先回答「我的地址和端口是什么」—— 顺序错了就死锁。
     """
 
     def __init__(self, rank: int, world_size: int,
@@ -99,6 +99,7 @@ def main() -> None:
     print(f"2. 其余 {WORLD_SIZE - 1} 个 rank 已创建（句柄就绪，进程组尚未建立）")
 
     # ── 3. ⚠️ 必须【全部提交】再一起 get ─────────────────────────
+    #    ❌ 错误写法：for w in workers: ray.get(w.setup.remote())  -> 死锁
     print("3. 并发提交 setup()（先全部 .remote()，再一起 ray.get）")
     for msg in ray.get([w.setup.remote() for w in workers]):
         print("   ", msg)
@@ -118,7 +119,7 @@ if __name__ == "__main__":
 
 ```bash
 uv sync --extra dist
-uv run python lessons/06_rendezvous.py
+uv run python lessons/py/06_rendezvous.py
 ```
 
 ## ④ 你应该观察到什么
@@ -169,7 +170,7 @@ Ray 的 `.remote()` 是异步提交、`ray.get` 是同步等待——**把 `ray.
 上面只证明了"能通"。**走的是 NVLink 还是 PCIe 还是网络**，要用 `NCCL_DEBUG` 看：
 
 ```bash
-NCCL_DEBUG=INFO uv run python lessons/06_rendezvous.py 2>&1 \
+NCCL_DEBUG=INFO uv run python lessons/py/06_rendezvous.py 2>&1 \
   | grep -iE "via|NET/|NCCL WARN|NVLS" | head -30
 ```
 

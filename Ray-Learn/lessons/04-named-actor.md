@@ -17,10 +17,15 @@
 
 ## ③ 完整代码
 
-存成 `lessons/04_named_actor.py`：
+存成 `lessons/py/04_named_actor.py` —— 📄 **可运行版本就在该文件里，⭐ 以它为准**（本文下面的代码块与它同步维护；改代码请改 `py/`，再回填这里）：
 
 ```python
-"""L04 · 具名 actor 与生命周期。"""
+"""L04 · 具名 actor 与生命周期。
+
+⚠️ 本脚本【只观察、不假设】：actor 崩了之后调用方到底看到什么异常、
+   actor 自己会不会跟着死 —— 这些行为随 Ray 版本变。
+   脚本把实际观察到的打印出来，md 里写了两种可能的含义。
+"""
 import time
 import ray
 
@@ -34,68 +39,62 @@ class Service:
         return f"pong from {self.tag}"
 
     def die(self) -> None:
-        """让这个 actor 自己崩掉（模拟训练 rank 挂掉）。"""
-        raise RuntimeError(f"{self.tag} crashed on purpose")
+        """在这个方法里抛异常（模拟某次调用失败，不一定是 actor 崩了）。"""
+        raise RuntimeError(f"{self.tag} raised on purpose")
 
 
 def main() -> None:
     ray.init()
 
-    # ── 1. 用名字创建（两个属性：name + namespace）────────────────
+    # ── 1. 用名字创建（name + namespace 两个属性）─────────────────
     svc = Service.options(name="train_rank0", namespace="lux").remote("r0")
     print("1. 已创建具名 actor: name=train_rank0 namespace=lux")
     print("   ping ->", ray.get(svc.ping.remote()))
 
-    # ── 2. 别的代码不用拿到句柄，也能按名字找到它 ──────────────────
+    # ── 2. 别的代码不用拿句柄，也能按名字找到它 ───────────────────
     handle = ray.get_actor("train_rank0", namespace="lux")
     print("2. get_actor 拿到句柄 ->", ray.get(handle.ping.remote()))
 
-    # ⚠️ namespace 不匹配会找不到
     try:
         ray.get_actor("train_rank0", namespace="wrong_ns")
+        print("   ⚠️ 换 namespace 竟然还能找到")
     except ValueError as e:
-        print(f"   换一个 namespace 就找不到了: {type(e).__name__}: {e}")
+        print(f"   换 namespace 找不到: {type(e).__name__}: {str(e)[:80]}")
 
-    # ── 3. actor 自己崩了以后，调用方看到什么 ─────────────────────
-    print("\n3. 让 actor 自己抛异常（模拟 rank 挂掉）")
+    # ── 3. 方法里抛异常：调用方看到什么？actor 还活着吗？ ─────────
+    print("\n3. 调 die()（方法里抛 RuntimeError）")
     try:
         ray.get(handle.die.remote())
-    except ray.exceptions.RayActorError as e:
-        print(f"   ✅ 抛的是 RayActorError（不是原异常！）")
-        print(f"      {str(e)[:200]}")
+        print("   ⚠️ 没有抛异常？")
+    except Exception as e:                       # noqa: BLE001 —— 故意宽catch，要打印真实类型
+        print(f"   调用方看到: {type(e).__name__}")
+        print(f"   {str(e)[:120]}")
 
-    # ── 4. 崩了之后，名字还能用吗？ ───────────────────────────────
-    print("\n4. 崩了之后再 get_actor / 再调用")
-    found = None
-    for attempt in range(5):
-        try:
-            found = ray.get_actor("train_rank0", namespace="lux")
-            print(f"   第 {attempt + 1} 次 get_actor: 还能拿到句柄")
-            break
-        except ValueError:
-            print(f"   第 {attempt + 1} 次 get_actor: ValueError（名字已注销）")
-            break
-        finally:
-            time.sleep(0.2)
+    try:
+        print("   之后再 ping ->", ray.get(handle.ping.remote()))
+        print("   ⇒ actor 【没有】因为方法抛异常而死")
+    except Exception as e:                       # noqa: BLE001
+        print(f"   之后再 ping 失败: {type(e).__name__} ⇒ actor 死了")
 
-    if found is not None:
-        try:
-            ray.get(found.ping.remote())
-            print("   ⚠️ 还能 ping 通 —— 与预期不符，见下方排查")
-        except ray.exceptions.RayActorError as e:
-            print(f"   ✅ 调用抛 RayActorError: {str(e)[:120]}")
-
-    # ── 5. 显式杀死（正常路径）────────────────────────────────────
-    print("\n5. 显式 ray.kill 一个【正常】的 named actor")
+    # ── 4. 显式 ray.kill：这才是真的杀死 ─────────────────────────
+    print("\n4. ray.kill 一个正常运行中的具名 actor")
     svc2 = Service.options(name="svc2", namespace="lux").remote("s2")
     ray.get(svc2.ping.remote())
     ray.kill(svc2)
-    time.sleep(0.5)
-    try:
-        ray.get_actor("svc2", namespace="lux")
-        print("   get_actor 仍能拿到（GCS 注销有延迟）")
-    except ValueError as e:
-        print(f"   ✅ get_actor: ValueError: {str(e)[:120]}")
+
+    # ⚠️ GCS 注销有延迟 —— 轮询而不是睡一觉就断言
+    gone_at = None
+    for attempt in range(20):
+        try:
+            ray.get_actor("svc2", namespace="lux")
+            time.sleep(0.1)
+        except ValueError:
+            gone_at = attempt
+            break
+    if gone_at is None:
+        print("   1 秒后 get_actor 仍能拿到句柄（GCS 注销延迟，属正常最终一致）")
+    else:
+        print(f"   ✅ 第 {gone_at + 1} 次轮询时 get_actor 抛 ValueError（名字已注销）")
 
     ray.shutdown()
 
@@ -105,7 +104,7 @@ if __name__ == "__main__":
 ```
 
 ```bash
-uv run python lessons/04_named_actor.py
+uv run python lessons/py/04_named_actor.py
 ```
 
 ## ④ 你应该观察到什么
@@ -114,26 +113,30 @@ uv run python lessons/04_named_actor.py
 1. 已创建具名 actor: name=train_rank0 namespace=lux
    ping -> pong from r0
 2. get_actor 拿到句柄 -> pong from r0
-   换一个 namespace 就找不到了: ValueError: ...
-3. 让 actor 自己抛异常（模拟 rank 挂掉）
-   ✅ 抛的是 RayActorError（不是原异常！）
-      ...RuntimeError: r0 crashed on purpose...
-4. 崩了之后再 get_actor / 再调用
-   第 1 次 get_actor: ValueError（名字已注销）
-5. 显式 ray.kill 一个【正常】的 named actor
-   ✅ get_actor: ValueError: ...
+   换 namespace 找不到: ValueError: ...
+
+3. 调 die()（方法里抛 RuntimeError）
+   调用方看到: RayTaskError(RuntimeError)      ← ⚠️ 类型随版本变，见下
+   ...
+   之后再 ping -> pong from r0
+   ⇒ actor 【没有】因为方法抛异常而死
+
+4. ray.kill 一个正常运行中的具名 actor
+   ✅ 第 2 次轮询时 get_actor 抛 ValueError（名字已注销）
 ```
 
 ### ⚠️ 本课最可能"不符合预期"的地方
 
 | 现象 | 说明 |
 | --- | --- |
-| 第 4 步 `get_actor` 还能拿到句柄 | **GCS 注销有延迟**，这是正常的最终一致行为。第 5 步加了 `sleep(0.5)` 就是为它 |
-| `die()` 抛的不是 `RayActorError` 而是 `RuntimeError` | Ray 会把 actor 内部的异常**包一层**再抛给调用方；若你看到原始 `RuntimeError`，说明 Ray 版本行为不同——**以你实际看到的为准**，但要知道两种都可能 |
-| 第 4 步之后 actor 没死，还能 ping 通 | `die()` 只是让**这一次调用**抛异常，actor 默认**不会**因此死掉。真正让 actor 死的是未捕获异常**导致 actor 退出**——不同 Ray 版本对"方法抛异常是否杀死 actor"的处理需要你自己确认（这正是本课要你观察的点） |
+| 第 3 步 `die()` 抛出的类型不是 `RayTaskError` | ⚠️ **类型随 Ray 版本变**：可能是 `RayTaskError(RuntimeError)`、`RayActorError`，也可能是原始 `RuntimeError`。**脚本会把真实类型打印出来**——记下你看到的那一个 |
+| 第 3 步之后 actor 还能 ping 通 | 说明**方法抛异常没有杀死 actor**（常见默认行为）。但这**不是保证**——正好是本课要你确认的点 |
+| 第 4 步轮询 20 次仍能拿到句柄 | **GCS 注销有延迟**，属正常的最终一致。把 `range(20)` 调大或 `sleep` 加长再看 |
+| 第 4 步第 1 次轮询就 ValueError | 注销很快，也是正常的——**两种都快/慢都可能**，不要据此下结论 |
 
-> ⭐ **第 4 步的"以你实际看到的为准"是刻意的**：故障可见性的写法**完全取决于**这个行为，
-> 而它随 Ray 版本变。**先测出来，再写代码**——不要照抄别人的 `try/except`。
+> ⭐ **本课刻意不给你"标准答案"**：故障可见性的写法**完全取决于**上面这两个行为，
+> 而它们**随 Ray 版本变**。脚本只负责把观察到的打印出来。
+> **先在你的版本上测出来，再写 `try/except`**——不要照抄别人的。
 
 ## ⑤ ⭐ 为什么 Lux 关心这个
 

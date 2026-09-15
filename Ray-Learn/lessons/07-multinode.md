@@ -99,15 +99,48 @@ export GLOO_SOCKET_IFNAME=<高速网卡>     # 与 torch 的 gloo 共用
 
 ## ④ 断言：这一步不过，后面全是错的
 
-存成 `lessons/07_check_cluster.py`：
+存成 `lessons/py/07_check_cluster.py` —— 📄 **可运行版本就在该文件里，⭐ 以它为准**（本文下面的代码块与它同步维护；改代码请改 `py/`，再回填这里）：
 
 ```python
-"""L07 · 多机集群断言：节点数 + GPU 账本。"""
+"""L07 · 多机集群断言：节点数 + GPU 账本（+ 可选：rank↔GPU 稳定性）。
+
+用法:
+    uv run python 07_check_cluster.py                 # 只查账本
+    uv run python 07_check_cluster.py --dump-ranks    # 另起 4 个 actor 打印 rank→(node,gpu)
+"""
+import os
 import sys
 import ray
 
 EXPECTED_NODES = 4
 EXPECTED_GPU = 16          # ⭐ 2 个训练节点 × 8，不是 32
+
+
+@ray.remote(num_gpus=1, num_cpus=1)
+class Probe:
+    def __init__(self, rank: int):
+        self.rank = rank
+
+    def where(self) -> str:
+        return (f"rank={self.rank} node={ray.util.get_node_ip_address()} "
+                f"gpu={os.environ.get('CUDA_VISIBLE_DEVICES', '?')}")
+
+
+def dump_ranks() -> None:
+    """⭐ 用于验证 bundle 重排序是否必要：跑两次，输出必须【完全一致】。"""
+    from ray.util.placement_group import placement_group
+    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+    n = 4
+    pg = placement_group([{"GPU": 1, "CPU": 1}] * n, strategy="STRICT_SPREAD")
+    ray.get(pg.ready())
+    actors = [
+        Probe.options(scheduling_strategy=PlacementGroupSchedulingStrategy(
+            placement_group=pg, placement_group_bundle_index=i)).remote(i)
+        for i in range(n)
+    ]
+    for line in ray.get([a.where.remote() for a in actors]):
+        print(line)
 
 
 def main() -> int:
@@ -120,9 +153,8 @@ def main() -> int:
     for n in sorted(nodes, key=lambda x: x["NodeManagerAddress"]):
         res = n["Resources"]
         gpu = res.get("GPU", 0)
-        cpu = res.get("CPU", 0)
         total_gpu += gpu
-        print(f"  {n['NodeManagerAddress']:<16} CPU={cpu:<6} GPU={gpu}")
+        print(f"  {n['NodeManagerAddress']:<16} CPU={res.get('CPU', 0):<8} GPU={gpu}")
 
     print(f"\nGPU 总账: {ray.cluster_resources().get('GPU', 0)}")
     print(f"CPU 总账: {ray.cluster_resources().get('CPU', 0)}")
@@ -132,11 +164,16 @@ def main() -> int:
         print(f"❌ 节点数 {len(nodes)} != {EXPECTED_NODES}")
         ok = False
     if total_gpu != EXPECTED_GPU:
-        print(f"❌ GPU 账本 {total_gpu} != {EXPECTED_GPU}"
-              f"{'（很可能是推理节点带着卡 join 了 —— 检查 --num-gpus=0）' if total_gpu > EXPECTED_GPU else ''}")
+        hint = ("（很可能是推理节点带着卡 join 了 —— 检查 --num-gpus=0）"
+                if total_gpu > EXPECTED_GPU else "")
+        print(f"❌ GPU 账本 {total_gpu} != {EXPECTED_GPU}{hint}")
         ok = False
-
     print("\n✅ 集群账本正确" if ok else "\n❌ 账本不对，先修它再往下走")
+
+    if "--dump-ranks" in sys.argv:
+        print("\n--- rank ↔ (node, gpu) ---")
+        dump_ranks()
+
     ray.shutdown()
     return 0 if ok else 1
 
@@ -146,7 +183,7 @@ if __name__ == "__main__":
 ```
 
 ```bash
-uv run python lessons/07_check_cluster.py
+uv run python lessons/py/07_check_cluster.py
 ```
 
 期望输出：
@@ -200,8 +237,8 @@ for info in ray.get([a.where.remote() for a in actors]):
 跑**两次**同样的绑定，把 `rank → (node_ip, gpu_id)` 记下来：
 
 ```bash
-uv run python lessons/07_check_cluster.py --dump-ranks > run1.txt
-uv run python lessons/07_check_cluster.py --dump-ranks > run2.txt
+uv run python lessons/py/07_check_cluster.py --dump-ranks > run1.txt
+uv run python lessons/py/07_check_cluster.py --dump-ranks > run2.txt
 diff run1.txt run2.txt && echo "✅ rank↔GPU 映射稳定"
 ```
 
