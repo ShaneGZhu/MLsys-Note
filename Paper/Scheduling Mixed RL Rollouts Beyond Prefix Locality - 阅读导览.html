@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>Scheduling Mixed RL Rollouts Beyond Prefix Locality - 阅读导览</title>
+  <style>
+    :root {
+      --paper: #f7f7f3;
+      --surface: #ffffff;
+      --ink: #202521;
+      --muted: #626a64;
+      --line: #d9ddd8;
+      --green: #176b50;
+      --green-soft: #e8f2ed;
+      --amber: #a35712;
+      --amber-soft: #fff2df;
+      --blue: #315c87;
+      --blue-soft: #e9f0f7;
+      --red: #a63d32;
+      --shadow: 0 8px 24px rgba(25, 32, 27, 0.08);
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      font-size: 16px;
+      line-height: 1.75;
+      letter-spacing: 0;
+    }
+    a { color: var(--green); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    a:hover { color: var(--amber); }
+    button { font: inherit; }
+    .progress { position: fixed; inset: 0 0 auto; height: 4px; background: transparent; z-index: 20; }
+    .progress > span { display: block; width: 0; height: 100%; background: var(--amber); }
+    .topbar {
+      position: sticky; top: 0; z-index: 12;
+      border-bottom: 1px solid var(--line); background: color-mix(in srgb, var(--paper) 94%, transparent);
+      backdrop-filter: blur(12px);
+    }
+    .topbar-inner { max-width: 1220px; height: 56px; margin: 0 auto; padding: 0 24px; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
+    .brand { font-weight: 760; line-height: 1.2; }
+    .top-actions { display: flex; align-items: center; gap: 8px; }
+    .btn {
+      display: inline-flex; align-items: center; justify-content: center; min-height: 34px; padding: 5px 10px;
+      border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: var(--surface);
+      text-decoration: none; cursor: pointer;
+    }
+    .btn:hover { border-color: var(--green); color: var(--green); }
+    .layout { max-width: 1220px; margin: 0 auto; padding: 44px 24px 96px; display: grid; grid-template-columns: 230px minmax(0, 790px); gap: 54px; justify-content: center; }
+    .toc { position: sticky; top: 82px; align-self: start; max-height: calc(100vh - 100px); overflow: auto; padding-right: 10px; }
+    .toc-title { margin: 0 0 12px; color: var(--muted); font-size: 12px; font-weight: 800; text-transform: uppercase; }
+    .toc a { display: block; padding: 6px 10px; border-left: 2px solid var(--line); color: var(--muted); font-size: 13px; line-height: 1.4; text-decoration: none; }
+    .toc a:hover, .toc a.active { border-left-color: var(--amber); color: var(--ink); background: var(--amber-soft); }
+    main { min-width: 0; }
+    .hero { padding: 8px 0 38px; border-bottom: 1px solid var(--line); }
+    .eyebrow { margin: 0 0 10px; color: var(--green); font-weight: 800; font-size: 13px; }
+    h1 { margin: 0; max-width: 760px; font-family: ui-serif, Georgia, "Songti SC", serif; font-size: clamp(34px, 5vw, 58px); line-height: 1.08; letter-spacing: 0; }
+    .subtitle { margin: 20px 0 0; max-width: 720px; color: var(--muted); font-size: 19px; }
+    .meta { margin-top: 22px; display: flex; flex-wrap: wrap; gap: 8px 18px; color: var(--muted); font-size: 13px; }
+    section { scroll-margin-top: 76px; padding: 46px 0 12px; }
+    h2 { margin: 0 0 20px; font-family: ui-serif, Georgia, "Songti SC", serif; font-size: 30px; line-height: 1.25; letter-spacing: 0; }
+    h3 { margin: 34px 0 12px; font-size: 19px; line-height: 1.35; }
+    h4 { margin: 0 0 8px; font-size: 16px; }
+    p { margin: 0 0 16px; }
+    .lead { font-size: 18px; color: #3f4841; }
+    .paper-block { margin: 24px 0; padding: 20px 22px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    .paper-block > :last-child { margin-bottom: 0; }
+    .dual { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .dual > div { min-width: 0; }
+    .en { color: #354239; font-family: ui-serif, Georgia, "Times New Roman", serif; }
+    .zh { color: var(--ink); }
+    .lang-label { display: block; margin-bottom: 6px; color: var(--green); font-size: 11px; font-weight: 850; letter-spacing: .04em; text-transform: uppercase; }
+    .quote-en { margin: 0; padding-left: 14px; border-left: 3px solid var(--blue); font-size: 15px; line-height: 1.65; }
+    .section-label { margin: 0 0 9px; color: var(--amber); font-size: 12px; font-weight: 850; letter-spacing: .06em; text-transform: uppercase; }
+    .figure-note { margin: 16px 0; padding: 14px 16px; border: 1px dashed var(--line); background: #fbfcfa; color: var(--muted); font-size: 14px; }
+    .thesis { margin: 24px 0; padding: 24px; border-left: 5px solid var(--green); background: var(--green-soft); font-family: ui-serif, Georgia, "Songti SC", serif; font-size: 21px; line-height: 1.6; }
+    .callout { margin: 22px 0; padding: 18px 20px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    .callout strong:first-child { color: var(--amber); }
+    .warning { border-left: 4px solid var(--amber); background: var(--amber-soft); }
+    .plain { border-left: 4px solid var(--blue); background: var(--blue-soft); }
+    .three-col { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 22px 0; }
+    .profile { padding: 16px; border-top: 4px solid var(--line); background: var(--surface); }
+    .profile.agent { border-top-color: var(--green); }
+    .profile.rlvr { border-top-color: var(--amber); }
+    .profile.rlhf { border-top-color: var(--blue); }
+    .profile p { margin: 5px 0 0; color: var(--muted); font-size: 14px; }
+    .flow { margin: 26px 0; display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 10px; align-items: stretch; }
+    .flow-step { padding: 18px 14px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    .flow-step span { display: block; margin-bottom: 5px; color: var(--green); font-size: 12px; font-weight: 800; text-transform: uppercase; }
+    .flow-arrow { align-self: center; color: var(--amber); font-size: 24px; }
+    .equation-list { display: grid; gap: 18px; }
+    .equation {
+      border: 1px solid var(--line); border-radius: 6px; overflow: hidden; background: var(--surface);
+      box-shadow: var(--shadow);
+    }
+    .equation-head { padding: 14px 18px; display: flex; justify-content: space-between; gap: 16px; border-bottom: 1px solid var(--line); }
+    .eq-no { flex: 0 0 auto; color: var(--amber); font-weight: 800; }
+    .formula { overflow-x: auto; padding: 20px 18px; text-align: center; background: #fbfcfa; font-family: "STIX Two Math", "Cambria Math", Georgia, serif; font-size: 21px; line-height: 1.45; }
+    math { font-family: "STIX Two Math", "Cambria Math", serif; }
+    .equation-body { padding: 18px; }
+    .equation-body p:last-child { margin-bottom: 0; }
+    .vars { display: grid; grid-template-columns: 110px 1fr; gap: 4px 14px; margin: 12px 0; font-size: 14px; }
+    .vars dt { color: var(--green); font-family: "STIX Two Math", "Cambria Math", serif; font-weight: 700; }
+    .vars dd { margin: 0; color: var(--muted); }
+    .example { margin-top: 12px; padding: 12px 14px; border-left: 3px solid var(--blue); background: var(--blue-soft); font-size: 14px; }
+    .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; margin: 24px 0; border: 1px solid var(--line); background: var(--line); }
+    .metric { padding: 20px; background: var(--surface); }
+    .metric b { display: block; color: var(--green); font-family: ui-serif, Georgia, serif; font-size: 29px; }
+    .metric span { color: var(--muted); font-size: 13px; }
+    .bars { margin: 26px 0; }
+    .bar-row { display: grid; grid-template-columns: 180px 1fr 64px; gap: 12px; align-items: center; margin: 11px 0; }
+    .bar-label { font-size: 13px; }
+    .bar-track { height: 18px; background: #e5e8e4; }
+    .bar-value { height: 100%; background: var(--green); }
+    .bar-value.amber { background: var(--amber); }
+    .bar-number { font-variant-numeric: tabular-nums; font-weight: 750; font-size: 13px; text-align: right; }
+    table { width: 100%; border-collapse: collapse; margin: 20px 0; font-size: 14px; }
+    th, td { padding: 11px 10px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; }
+    tbody tr:hover { background: var(--green-soft); }
+    .checklist { padding-left: 20px; }
+    .checklist li { margin: 8px 0; }
+    details { margin: 12px 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+    summary { cursor: pointer; padding: 14px 16px; font-weight: 750; }
+    details > div { padding: 0 16px 16px; color: var(--muted); }
+    .refs { display: grid; gap: 12px; }
+    .ref { padding: 16px 18px; border-left: 3px solid var(--line); background: var(--surface); }
+    .ref:hover { border-left-color: var(--green); }
+    .ref h3 { margin: 0 0 6px; font-size: 16px; }
+    .ref-meta { margin-bottom: 7px; color: var(--muted); font-size: 12px; }
+    .ref p { margin: 0; color: #4f5751; font-size: 14px; }
+    .tag { display: inline-block; margin-right: 6px; padding: 1px 6px; border: 1px solid var(--line); border-radius: 3px; color: var(--muted); font-size: 11px; }
+    .verdict { margin: 30px 0; padding: 24px; border-top: 5px solid var(--ink); background: var(--surface); }
+    footer { margin-top: 52px; padding-top: 22px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; padding-top: 24px; gap: 12px; }
+      .toc { position: static; display: flex; overflow-x: auto; max-height: none; padding: 0 0 12px; }
+      .toc-title { display: none; }
+      .toc a { flex: 0 0 auto; border-left: 0; border-bottom: 2px solid var(--line); }
+      .toc a.active { border-bottom-color: var(--amber); }
+    }
+    @media (max-width: 640px) {
+      body { font-size: 15px; }
+      .topbar-inner { padding: 0 14px; }
+      .brand { max-width: 190px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .layout { padding: 18px 14px 64px; }
+      h1 { font-size: 36px; }
+      h2 { font-size: 26px; }
+      .subtitle { font-size: 17px; }
+      .three-col, .metric-grid { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; }
+      .flow-arrow { transform: rotate(90deg); justify-self: center; }
+      .bar-row { grid-template-columns: 125px 1fr 52px; gap: 7px; }
+      .vars { grid-template-columns: 76px 1fr; }
+      .top-actions .pdf-label { display: none; }
+      table { display: block; overflow-x: auto; }
+      .dual { grid-template-columns: 1fr; gap: 12px; }
+    }
+    @media print {
+      .topbar, .toc, .progress { display: none; }
+      .layout { display: block; max-width: 800px; padding: 0; }
+      .equation { break-inside: avoid; box-shadow: none; }
+      a { color: inherit; }
+    }
+  </style>
+</head>
+<body>
+  <div class="progress" aria-hidden="true"><span id="progressBar"></span></div>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">MISA-T 论文阅读导览</div>
+      <div class="top-actions">
+        <a class="btn" href="./Scheduling%20Mixed%20RL%20Rollouts%20Beyond%20Prefix%20Locality.pdf"><span class="pdf-label">打开原论文</span><span aria-hidden="true">↗</span></a>
+        <button class="btn" id="printBtn" type="button" title="打印或导出 PDF" aria-label="打印或导出 PDF">⎙</button>
+      </div>
+    </div>
+  </header>
+
+  <div class="layout">
+    <nav class="toc" aria-label="文章目录">
+      <p class="toc-title">Paper order / 论文顺序</p>
+      <a href="#overview">Abstract 摘要</a>
+      <a href="#introduction">1 Introduction</a>
+      <a href="#background">2 Background</a>
+      <a href="#formulation">3 Formulation</a>
+      <a href="#method">4 MISA-T</a>
+      <a href="#experiments">5 Evaluation</a>
+      <a href="#discussion">6 Discussion</a>
+      <a href="#conclusion">7 Conclusion</a>
+      <a href="#references">References</a>
+    </nav>
+
+    <main>
+      <header class="hero">
+        <p class="eyebrow">Bilingual paper companion · Systems for LLM post-training</p>
+        <h1>Scheduling Mixed RL Rollouts Beyond Prefix Locality</h1>
+        <p class="subtitle">按原论文顺序整理的中英对照精读文本：先读作者的问题陈述，再跟随公式、算法和实验结果，不把它改写成一份只讲结论的导读。</p>
+        <div class="meta"><span>Zetao Hong, Song Yuan, Yuanhao Ding, et al.</span><span>arXiv:2608.11152v1 · 11 Aug 2026</span><a href="https://arxiv.org/abs/2608.11152" target="_blank" rel="noreferrer">Original paper / 原论文</a><a href="./Scheduling%20Mixed%20RL%20Rollouts%20Beyond%20Prefix%20Locality.pdf">Local PDF / 本地 PDF</a></div>
+      </header>
+
+      <section id="overview">
+        <p class="section-label">Abstract / 摘要</p>
+        <h2>Abstract · 摘要</h2>
+        <div class="paper-block dual">
+          <div class="en"><span class="lang-label">English</span><p>Modern reinforcement learning (RL) post-training pipelines for large language models increasingly combine rollout workloads across multiple domains and feedback paradigms. Prefix-aware routing improves inference efficiency through cache reuse and load balancing, but it does not control how heterogeneous rollout sessions compete for KV-cache capacity. When reinforcement learning with verifiable rewards (RLVR), reinforcement learning from human feedback (RLHF), and agentic rollouts share an asynchronous inference service, their distinct sequence structures, interaction patterns, and KV-residency times create substantially different serving demands. Rollout scheduling must account for this heterogeneity without distorting the workload mixture specified by the trainer.</p><p>We present <b>MISA-T</b>, a routing-layer admission policy for mixed rollout serving. MISA-T combines adaptive session admission, workload-aware KV-capacity allocation, and residency-time-aware KV accounting. In rollout-only ablations on Step3.7 and Qwen3.6-35B-A3B, MISA-T improves rollout throughput over a sweep-tuned cache-aware vLLM Router by 53.3% and 43.6%, respectively, while maintaining high prefix-cache hit rates. In a matched 50-iteration Step3.7 experiment, it increases rollout throughput by 35.6% and reduces mean iteration time by 22.8%, while keeping the consumed workload mixture close to the trainer target and achieving comparable task scores.</p></div>
+          <div class="zh"><span class="lang-label">中文对照</span><p>现代大语言模型的强化学习后训练，越来越常把多个领域、多个反馈范式的 rollout 混在同一个生成服务里。感知前缀的路由可以依靠缓存复用和负载均衡提高推理效率，但它没有回答一个更基础的问题：异构 rollout session 如何竞争有限的 KV cache 容量？当 RLVR、RLHF 和 Agent rollout 共用异步推理服务时，它们不同的序列结构、交互方式和 KV 驻留时间，会产生明显不同的服务需求。调度器必须处理这种异构性，同时不能改变 trainer 规定的 workload 混合比例。</p><p>论文提出 <b>MISA-T</b>，一种位于路由层的混合 rollout 准入策略。它结合了自适应 session admission、按 workload 感知的 KV 容量分配，以及考虑驻留时间的 KV 记账。在固定 checkpoint 的实验中，相比经过 sweep 调参的 cache-aware vLLM Router，MISA-T 在 Step3.7 和 Qwen3.6-35B-A3B 上分别提高 rollout throughput 53.3% 和 43.6%。在匹配的 50 次 Step3.7 训练迭代中，rollout throughput 提高 35.6%，平均 iteration time 降低 22.8%，消耗的 workload mix 仍接近 trainer 目标，任务分数也相当。</p></div>
+        </div>
+        <div class="thesis">一句话概括：<b>prefix routing 决定“请求去哪儿”，MISA-T 额外决定“哪些新 session 现在有资格进入缓存工作集”。</b></div>
+      </section>
+
+      <section id="introduction">
+        <p class="section-label">1 Introduction</p>
+        <h2>1 · Introduction / 引言</h2>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>Modern RL post-training treats rollout generation as a distributed serving workload. A trainer releases prompts or agent tasks, the rollout layer translates them into model-generation requests, and a router assigns those requests to inference instances that reuse cached KV state whenever possible. PagedAttention, RadixAttention and distributed prefix-aware routing make prefix reuse a central efficiency objective.</p><p>The problem becomes harder when a rollout stream contains heterogeneous workloads. Multi-domain RL and multi-teacher on-policy distillation create shared inference pools where RLVR tends to have short prompts and long decode tails, RLHF has more balanced prompt and response lengths, and agentic trajectories require session continuity across repeated long-prefix calls and intervening tool execution. A cache miss on a later agent turn requires prefill of the accumulated interaction history.</p></div><div class="zh"><span class="lang-label">中文对照</span><p>现代 RL 后训练可以看成一个分布式 serving workload：trainer 释放 prompt 或 agent task，rollout 层把它们转成模型请求，router 把请求分到不同推理实例，并尽量复用已经存在的 KV。PagedAttention、RadixAttention 和分布式 prefix-aware routing 让“前缀复用”成为 serving 的核心效率目标。</p><p>当一条 rollout 流包含异构 workload 时，问题会更难。多领域 RL 和多教师 on-policy distillation 会共用一个 inference pool：RLVR 往往是短输入、长 decode；RLHF 的输入和输出更均衡；Agent trajectory 则需要在多次长前缀调用之间保持 session continuity，中间还夹着工具执行。Agent 后续轮次一旦 cache miss，就必须重新 prefill 累积的交互历史。</p></div></div>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>The trainer controls staleness and maximum concurrency, while the router controls serving-side admission and instance selection. Choosing the instance with the largest cached prefix alone does not control how many sessions compete for KV capacity or how capacity should be shared across workloads. MISA-T therefore separates the trainer's mixture contract from the router's resource controller.</p></div><div class="zh"><span class="lang-label">中文对照</span><p>Trainer 控制 policy staleness 和最大并发；router 控制服务侧准入和实例选择。只选择“缓存前缀最长”的实例，并不能限制有多少 session 同时争抢 KV，也不能决定不同 workload 如何分享容量。因此 MISA-T 把 trainer 的 mix contract 和 router 的 resource controller 分开：trainer 决定要采样什么，router 决定这些请求如何有序进入缓存。</p></div></div>
+        <h3>Contributions / 贡献</h3>
+        <div class="three-col"><div class="profile agent"><b>1. Overload-aware session admission</b><p>根据观测到的 KV demand 和 overload pressure 推导动态 admission cap；超过 cap 的新 session 暂存并重试，已有 continuation 受到保护。</p></div><div class="profile rlvr"><b>2. Workload-aware capacity allocation</b><p>按 RLVR、RLHF 和 agentic workload 的需求与 KV footprint 划分 protected admission capacity。</p></div><div class="profile rlhf"><b>3. Residency-time-aware accounting</b><p>用 session 的 KV 驻留时间给需求加权，将 footprint allocation 扩展成 KV block-time accounting。</p></div></div>
+        <div class="callout plain"><strong>作者的边界声明：</strong>这是一项 routing-layer policy。它不改变 model execution、physical KV allocation、agent runtime，也不改变 trainer 设定的 workload distribution。</div>
+      </section>
+
+      <section id="background">
+        <p class="section-label">2 Background and Motivation</p>
+        <h2>2 · Background and Motivation / 背景与动机</h2>
+        <h3>2.1 Rollout serving architecture / Rollout 服务架构</h3>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>The trainer releases rollout tasks and bounds in-flight work through maximum-concurrency and policy-version staleness limits. Rollout workers translate tasks into model requests. A routing layer performs request admission and selects an inference instance. For agentic workloads, an agent server maintains the interaction loop and executes tool actions in an isolated sandbox. MISA-T needs only request metadata, runtime metrics and lightweight session-cache snapshots.</p></div><div class="zh"><span class="lang-label">中文对照</span><p>Trainer 释放 rollout task，并用 maximum concurrency 与 policy-version staleness 限制 in-flight work。Rollout worker 把 task 转成模型请求；routing layer 做 request admission 并选择 inference instance。Agent workload 还需要 agent server 维护交互循环，在隔离 sandbox 中执行工具动作。MISA-T 只需要 request metadata、runtime metrics 和轻量 session-cache snapshot。</p></div></div>
+        <div class="flow" role="img" aria-label="论文系统架构"><div class="flow-step"><span>Rollout side</span><b>Trainer → Rollout controller</b><br>释放任务、控制版本新鲜度和外层并发</div><div class="flow-arrow">→</div><div class="flow-step"><span>Routing layer</span><b>Router + admission policy</b><br>MISA-T 在这里决定 HOLD 或 ADMIT</div><div class="flow-arrow">→</div><div class="flow-step"><span>Serving side</span><b>Inference instances</b><br>执行 model calls、上报 metrics 和 cache snapshot</div></div>
+        <h3>2.2 Mixed rollout generation / 混合 rollout 生成</h3>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>A mixed stream can arise from joint multi-domain RL or from staged capability-integration pipelines. MOPD samples prompts from a multi-domain dataset, generates student rollouts, and routes each trajectory to its matching teacher. Similar integration patterns appear in MiMo-V2-Flash, Kimi K3, Nemotron 3 Ultra and Nemotron-Cascade 2. The trainer defines sampling distribution and rollout-group semantics; serving should improve efficiency without redefining them.</p></div><div class="zh"><span class="lang-label">中文对照</span><p>混合流可能来自联合多领域 RL，也可能来自分阶段的能力整合流程。MOPD 从多领域数据集采样 prompt，生成 student rollout，再把每条 trajectory 路由到匹配的 teacher。MiMo-V2-Flash、Kimi K3、Nemotron 3 Ultra 和 Nemotron-Cascade 2 都体现了类似的能力整合模式。Trainer 定义 sampling distribution 和 rollout-group semantics；serving 层只能提高效率，不能重定义这些语义。</p></div></div>
+        <h3>2.3 Prefix-aware routing / 前缀感知路由</h3>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>Prefix-aware systems establish a common design: PagedAttention improves KV memory management; SGLang introduces RadixAttention; Preble balances distributed prefix reuse and load; DLPM/D2LPM combines reuse with fairness; k-LPM adds latency constraints. vLLM Router belongs to this family. Its cache-aware policy controls placement but not admission: it picks an instance for a request but does not limit how many new sessions enter it.</p></div><div class="zh"><span class="lang-label">中文对照</span><p>这些系统共同建立了 prefix-aware load balancing：PagedAttention 改善 KV memory management；SGLang 用 RadixAttention 复用结构化调用的前缀；Preble 平衡分布式 prefix reuse 和负载；DLPM/D2LPM 把 reuse 与公平性结合；k-LPM 加入 latency constraint。vLLM Router 也属于这一路线。它控制 placement，却不控制 admission：会为请求选实例，但不会限制有多少新 session 进入该实例。</p></div></div>
+        <div class="callout warning"><strong>本文指出的缺口：</strong>已有 routing 主要优化 placement、load balancing 或 prefix reuse，没有按 workload-class 的 KV block-time demand 分配 admission capacity。Prefix hit rate 只能说明避免了多少 prefill，不能单独代表 rollout-serving efficiency。</div>
+        <h3>2.4 Workload asymmetry / Workload 不对称</h3>
+        <p>作者强调，下面这些是 trace 中观察到的 serving profile，不是对 RLVR、RLHF 或 agentic training 的绝对定义。模型、数据集和环境会改变具体长度。</p>
+        <table><thead><tr><th>Characteristic / 特征</th><th>RLVR</th><th>RLHF</th><th>Agentic</th></tr></thead><tbody><tr><td>Observed turns</td><td>Single-turn</td><td>Single-turn</td><td>Multi-turn</td></tr><tr><td>Token lengths</td><td>Short input; long output<br>短输入，长输出</td><td>Medium input and output<br>输入输出中等</td><td>Long input; short output<br>长输入，短输出</td></tr><tr><td>KV behavior</td><td>Decode-time growth</td><td>Moderate residency</td><td>Retained between turns</td></tr><tr><td>Dominant cost</td><td>Long decode</td><td>Prefill and decode</td><td>Prefix reuse + residency</td></tr></tbody></table>
+        <table><thead><tr><th>Workload</th><th>Requests / Sessions</th><th>Input p50 / p99</th><th>Output p50 / p99</th></tr></thead><tbody><tr><td>Agent</td><td>73,659 / 1,058</td><td>37,757 / 123,207</td><td>148 / 3,930</td></tr><tr><td>RLHF</td><td>599 / 599</td><td>60 / 2,564</td><td>7,344 / 37,101</td></tr><tr><td>RLVR</td><td>809 / 809</td><td>156 / 1,277</td><td>47,583 / 130,958</td></tr></tbody></table>
+        <p>在 128K context limit 的 trace 中，Agent 是 residency-heavy：长前缀在工具交错的多轮之间保留；RLVR 是 decode-heavy：长输出主导。Agent 的 tool/orchestration gap 也不可忽略：Step3.7 为 6.6%，Qwen3.6-35B-A3B 为 22.7%。如果只量 model inference time，会低估 KV residency。</p>
+        <h3>2.5 Why placement-only routing falls short / 只做 placement 为什么失效</h3>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>On Qwen3.6-35B-A3B, raising vLLM Router to a high-load concurrency ceiling reduces request throughput by 52.5%, effective prefill throughput by 57.3%, and decode throughput by 38.5% relative to its sweep-tuned operating point. Prefix-cache hit rate falls from 92.4% to 4.5%.</p></div><div class="zh"><span class="lang-label">中文对照</span><p>在 Qwen3.6-35B-A3B 上，把 vLLM Router 提高到高负载 concurrency ceiling 后，相比 sweep 调出的 operating point，request throughput 降低 52.5%，effective prefill throughput 降低 57.3%，decode throughput 降低 38.5%，prefix-cache hit 从 92.4% 跌到 4.5%。</p></div></div>
+        <div class="callout warning"><strong>正反馈 loop：</strong>更多新 session 进入 → resident KV working set 膨胀 → reusable continuation 被驱逐 → 后续请求变 cold prefill → 队列和 session overlap 变长 → eviction pressure 进一步上升。</div>
+        <p>Global session cap 可以打断这个 loop，但仍把所有 session 当成同质对象。由于 workload 的 KV footprint 和 residency time 差异很大，同一个 session count 并不能决定 protected capacity 应如何分给不同类。作者报告：在同一 mixed stream 和 permissive concurrency ceiling 下，MISA-T 相比 class-agnostic Session Admission 在 Step3.7 上提高 37.3%，在 Qwen3.6-35B-A3B 上提高 20.4%。</p>
+        <h3>2.6 Key insight and system challenges / 核心洞察与系统挑战</h3>
+        <div class="thesis">Admission is a KV commitment. / 准入是一项 KV 承诺。新 session 不只消耗当前容量，它还承诺未来的 KV 增长、后续 continuation，以及多轮之间的驻留时间。</div>
+        <p>在一个 scheduling epoch，某类有 N<sub>b</sub> 个未完成 session，平均 footprint 为 k̄<sub>b</sub>、平均驻留时间为 T<sub>b</sub>，那么它大约代表 N<sub>b</sub>k̄<sub>b</sub>T<sub>b</sub> 的 block-time 工作量。由此产生三个挑战：在线 admission 不能依赖反复 static concurrency sweep；accounting 必须处理 workload heterogeneity；准入还要与 cache-aware placement 和 KV offloading 组合，而不是接管它们。</p>
+      </section>
+
+      <section id="formulation">
+        <p class="section-label">3 Problem Formulation</p>
+        <h2>3 · Problem Formulation / 问题形式化</h2>
+        <h3>3.1 Trainer contract and routing decisions / Trainer 合约与路由决策</h3>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>Let B be workload classes and W inference instances. A rollout unit is one trainer-counted sample; a prompt may fan out into grouped units. Each request inherits a workload class b<sub>r</sub>, rollout-unit identity u<sub>r</sub>, session identity s<sub>r</sub>, and optional group identity g<sub>r</sub>. The trainer controls policy staleness, maximum concurrency and target mixture ρ. For each request, the router chooses π<sub>t</sub>(r) ∈ W ∪ {HOLD}: selecting an instance admits it; HOLD delays admission and periodically re-evaluates it.</p></div><div class="zh"><span class="lang-label">中文对照</span><p>设 B 是 workload classes，W 是 inference instances。一个 rollout unit 是 trainer 计数的一条 sample；一个 prompt 可能 fan out 成多个有 group 关系的 unit。每个 request 都继承 workload class b<sub>r</sub>、rollout-unit identity u<sub>r</sub>、session identity s<sub>r</sub>，以及可选的 group identity g<sub>r</sub>。Trainer 控制 policy staleness、maximum concurrency 和 target mixture ρ。Router 对每个 request 选择 π<sub>t</sub>(r) ∈ W ∪ {HOLD}：选实例意味着准入，HOLD 意味着延迟准入并周期性重评。</p></div></div>
+        <table><thead><tr><th>符号</th><th>含义 / Meaning</th></tr></thead><tbody><tr><td>B, W</td><td>workload class 集合、推理实例集合</td></tr><tr><td>A<sub>b</sub>(T), A(T)</td><td>截至 T 释放的 b 类 rollout units，以及总释放量</td></tr><tr><td>ρ ∈ Δ(B)</td><td>trainer 指定的目标 workload distribution</td></tr><tr><td>s<sub>r</sub></td><td>request r 所属 session；continuation 可复用已有 KV</td></tr><tr><td>π<sub>t</sub>(r)</td><td>在线的 placement / HOLD 决策</td></tr></tbody></table>
+        <h3>3.2 Prefix reuse and KV block-time demand / 前缀复用与 KV block-time</h3>
+        <div class="equation-list">
+          <article class="equation"><div class="equation-head"><b>Estimated prefill cost / 估计 prefill 成本</b><span class="eq-no">(1)</span></div><div class="formula">ĉ<sub>r,w</sub>(t) = d<sub>w</sub>(t) + <span class="frac">[L<sub>r</sub> − H<sub>r,w</sub>(t)] / μ<sub>w</sub>(t)</span></div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>The cost is queue delay plus the time to prefill only the non-reusable tokens. More prefix hit reduces the second term; a busy instance increases the first.</p></div><div class="zh"><span class="lang-label">中文</span><p>成本 = 排队等待时间 + 重新 prefill 未命中 token 所需时间。命中的前缀越长，第二项越小；实例越忙，第一项越大。比如 10,000 token 中命中 8,000，prefill 速度 2,000 token/s，排队 0.4s，则成本约为 1.4s。</p></div></div></article>
+          <article class="equation"><div class="equation-head"><b>KV occupation is block-time / KV 占用是 block-time</b><span class="eq-no">(2)</span></div><div class="formula">Z<sub>s</sub> = ∫ k<sub>s</sub>(t)dt ≈ k̄<sub>s</sub>T<sub>s</sub></div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>The integral is the area under the curve of retained KV blocks over time. For an agent, T<sub>s</sub> includes tool-execution intervals between model turns because reusable KV remains resident.</p></div><div class="zh"><span class="lang-label">中文</span><p>这是“KV blocks 随时间的曲线下面积”。Agent 在两次模型调用之间执行工具时，模型暂时不计算，但可复用 KV 仍驻留，所以这段时间也必须计入 T<sub>s</sub>。例如 120 blocks 驻留 30s，就是 3,600 block·s。</p></div></div></article>
+          <article class="equation"><div class="equation-head"><b>Protected capacity constraint / 保护容量约束</b><span class="eq-no">(3)</span></div><div class="formula">Σ<sub>s∈P<sub>w</sub>(t)</sub> k̃<sub>s</sub>(t) ≤ C<sub>w</sub>, &nbsp; ∀w∈W</div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>The reserved footprint of protected sessions on each instance cannot exceed its protected KV budget C<sub>w</sub>.</p></div><div class="zh"><span class="lang-label">中文</span><p>每台实例上 protected sessions 的 reserved footprint 之和不能超过 C<sub>w</sub>。C<sub>w</sub> 是给 locality 保留的控制预算，不等于整块物理显存；物理 cache 和 offloading 仍由 serving layer 管理。</p></div></div></article>
+        </div>
+        <h3>3.3 Scheduling objective under trainer contract / Trainer 合约下的调度目标</h3>
+        <div class="equation-list">
+          <article class="equation"><div class="equation-head"><b>Rollout throughput / Rollout 吞吐</b><span class="eq-no">(4)</span></div><div class="formula">S<sup>π</sup>(T) = <span class="frac">1 / T</span> Σ<sub>b∈B</sub> N<sup>π</sup><sub>b</sub>(T)</div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>N<sup>π</sup><sub>b</sub>(T) counts complete class-b rollout samples delivered to the trainer. An agent trajectory is counted once only after all turns and tool interactions finish.</p></div><div class="zh"><span class="lang-label">中文</span><p>N<sup>π</sup><sub>b</sub>(T) 是截至 T 完成并交付 trainer 的 b 类 sample 数。Agent trajectory 必须等所有轮次和工具交互完成才计 1，所以 rollout throughput 不等于 request RPM。</p></div></div></article>
+          <article class="equation"><div class="equation-head"><b>Long-run objective / 长期目标</b><span class="eq-no">(5)</span></div><div class="formula">max<sub>π</sub> lim inf<sub>T→∞</sub> S<sup>π</sup>(T) &nbsp; subject to &nbsp; Q<sup>π</sup><sub>b</sub>(T) = o(A(T)), ∀b∈B</div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>Maximize long-run completed samples while ensuring no offered class is persistently delayed. The little-o condition means Q<sub>b</sub>(T)/A(T) tends to zero, not that backlog is always zero.</p></div><div class="zh"><span class="lang-label">中文</span><p>最大化长期完成率，同时要求任何被提供的 workload class 都不能被持续饿住。o(A) 的意思是 Q<sub>b</sub>/A → 0，并不是积压必须始终为零。因为 N<sub>b</sub> = A<sub>b</sub> − Q<sub>b</sub>，只要 trainer 到达比例趋近 ρ、各类积压占比消失，完成的 mix 也会趋近 ρ。</p></div></div></article>
+        </div>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">Finite-run metric / 有限运行指标</span><p>D<sub>TV</sub>(p,q) = 1/2 ||p−q||<sub>1</sub> measures the distance between completed and target mixtures.</p></div><div class="zh"><span class="lang-label">直观解释</span><p>把每类比例差的绝对值相加再除以 2。目标 50/30/20、实际 46/33/21 时，DTV = (4+3+1)/2 = 4 个百分点，越接近 0 越好。</p></div></div>
+      </section>
+
+      <section id="method">
+        <p class="section-label">4 Mix-Aware Session Admission</p>
+        <h2>4 · MISA-T / 混合感知 Session 准入</h2>
+        <p class="lead">MISA-T 只改变 request-admission timing 和 inference-instance placement；它不改变 rollout unit、label、物理 KV allocation 或 agent runtime。Figure 2 的逻辑顺序是 Estimate → Allocate → Gate。</p>
+        <div class="flow"><div class="flow-step"><span>1 · Estimate</span><b>Block-time demand</b><br>R<sub>b</sub> = N<sub>b</sub> k̄<sub>b</sub> T̂<sub>b</sub></div><div class="flow-arrow">→</div><div class="flow-step"><span>2 · Allocate</span><b>Protected KV caps</b><br>按 class demand 划分 blocks</div><div class="flow-arrow">→</div><div class="flow-step"><span>3 · Gate</span><b>ADMIT or HOLD</b><br>continuation 优先，新 session 需要 headroom</div></div>
+        <h3>4.1 Adaptive session admission / 自适应 Session 准入</h3>
+        <div class="equation-list">
+          <article class="equation"><div class="equation-head"><b>Continuation priority / Continuation 优先</b><span class="eq-no">(6)</span></div><div class="formula">ADMIT(r,w) = { 1, if s<sub>r</sub>∈O<sub>w</sub>∪P<sub>w</sub>; &nbsp; 1, if |O<sub>w</sub>|+|P<sub>w</sub>| &lt; K<sub>w</sub>(t); &nbsp; 0, otherwise }</div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>O<sub>w</sub> is the observed active protected set. P<sub>w</sub> contains sessions already admitted but not yet visible in the latest asynchronous snapshot. Existing sessions continue without consuming another cap slot; a new session needs headroom.</p></div><div class="zh"><span class="lang-label">中文</span><p>O<sub>w</sub> 是已观测的 active protected sessions；P<sub>w</sub> 是已经放行、但还没出现在最新异步 snapshot 中的 pending sessions。Continuation 不重复消耗 cap；新 session 只有在 |O|+|P| 小于 K 时才能进入，否则 HOLD。把 pending 算进去，是为了避免两个 snapshot 之间连续超发。</p></div></div></article>
+          <article class="equation"><div class="equation-head"><b>Hold versus cold route / 等待缓存实例还是冷路由</b><span class="eq-no">(7)</span></div><div class="formula">Δ<sub>r</sub> + q<sub>hit</sub> − q<sub>cold</sub> &lt; H<sub>r</sub> / F</div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>Holding for a cached instance is preferable when the extra waiting and queueing cost is smaller than the prefill time saved by reusing H<sub>r</sub> tokens.</p></div><div class="zh"><span class="lang-label">中文</span><p>左边是坚持 locality 的额外等待和排队代价；右边是复用 H<sub>r</sub> 个 token 节省的 prefill 时间。只要左边更小，就值得 HOLD。若 H=40k、F=20k token/s，则缓存价值约 2s；即使额外等待 1.2s，仍应等待。</p></div></div></article>
+          <article class="equation"><div class="equation-head"><b>Relative prefix pressure / 相对前缀压力</b><span class="eq-no">(8)</span></div><div class="formula">G<sub>w</sub>(t) = max{0, h<sup>★</sup><sub>w</sub>(t) − ĥ<sub>w</sub>(t)}</div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>The controller compares observed hit rate with a recent healthy achievable reference instead of using a universal fixed threshold. Confirmation and slope checks filter transient changes.</p></div><div class="zh"><span class="lang-label">中文</span><p>压力是“健康参考命中率 − 当前命中率”，只有相对近期可达水平退化才产生压力。论文不硬编码 90% 之类的阈值，因为不同模型/workload 的可达水平不同；confirmation window 和 slope check 会过滤瞬时抖动。</p></div></div></article>
+        </div>
+        <p>Baseline cap 为 K<sup>base</sup><sub>w</sub>(t)=⌊C<sub>w</sub>/k̄<sub>w</sub>(t)⌋，其中 k̄ 来自已完成 session 长度的 moving window 和当前观测。Operational cap K<sub>w</sub>(t) 不超过 baseline；当 prefix hit 确认下降或等待队列持续存在时，controller 暂时收缩 current cap，再逐步恢复。Overload pressure 是长度参考滞后时的快速修正，不是 cap 的常规来源。</p>
+        <h3>4.2 Workload-aware session caps / 按 Workload 分配 Session Cap</h3>
+        <p>Global cap 只控制 aggregate instance load，无法阻止 dominant class 占满全部新 session 的容量。MISA 为每个 instance w、workload class b 维护 N<sub>w,b</sub>：active、pending、held 和 candidate session 都计入 demand ledger；held/candidate 尚未 admission 时不消耗 cap。每类的 k̄<sub>b</sub> 使用 conservative length priors、observed session blocks 和有界历史估计。</p>
+        <div class="equation-list"><article class="equation"><div class="equation-head"><b>Spatial demand / 空间需求</b><span class="eq-no">(9)</span></div><div class="formula">S<sub>w,b</sub> = N<sub>w,b</sub> k̄<sub>b</sub></div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>Number of unfinished session demands multiplied by the conservative resident-block estimate per session.</p></div><div class="zh"><span class="lang-label">中文</span><p>本类未完成 session 数 × 单 session 的保守 resident blocks 估计。它只看空间，不看驻留多久。</p></div></div></article><article class="equation"><div class="equation-head"><b>Spatial quota and cap / 空间配额与 cap</b><span class="eq-no">(10)</span></div><div class="formula">M<sup>space</sup><sub>w,b</sub> = C<sub>w</sub> · <span class="frac">S<sub>w,b</sub> / Σ<sub>b′</sub>S<sub>w,b′</sub></span><br>K<sup>space</sup><sub>w,b</sub> = max{1, ⌊M<sup>space</sup><sub>w,b</sub> / k̄<sub>b</sub>⌋}</div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>Protected blocks are split in proportion to spatial demand, then converted back to a session count. The max with 1 ensures every class has an entry point.</p></div><div class="zh"><span class="lang-label">中文</span><p>先按各类空间需求占比分配 protected blocks，再除以该类单 session footprint 得到 cap。max{1,...} 保证每类至少能进入一个 session，避免完全饥饿。它是 soft quota，不是强制 trainer 采样比例。</p></div></div></article></div>
+        <h3>4.3 KV-cache residency-time weighting / KV 驻留时间加权</h3>
+        <div class="equation-list"><article class="equation"><div class="equation-head"><b>Block-time proxy / Block-time 需求代理</b><span class="eq-no">(11)</span></div><div class="formula">R<sub>w,b</sub> = S<sub>w,b</sub> T̂<sub>b</sub> = N<sub>w,b</sub> k̄<sub>b</sub> T̂<sub>b</sub></div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>T̂<sub>b</sub> is the recent class-level duration during which useful KV remains attributable to class b. For a multi-turn agent it includes tool-execution gaps.</p></div><div class="zh"><span class="lang-label">中文</span><p>T̂<sub>b</sub> 是该 class 最近观测到的“有用 KV 仍归属于它”的 session duration。多轮 Agent 的工具执行 gap 也算在内。它把空间需求提升为空间 × 时间的 block-time demand。</p></div></article><article class="equation"><div class="equation-head"><b>Estimated drain time / 估计 backlog 清空时间</b><span class="eq-no">(12)</span></div><div class="formula">τ<sub>w,b</sub> ≈ <span class="frac">N<sub>w,b</sub> k̄<sub>b</sub> T̂<sub>b</sub> / M<sub>w,b</sub></span></div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>Backlog block-time divided by allocated parallel KV capacity estimates how long class b would take to drain. Allocating in proportion to R approximately equalizes τ across classes.</p></div><div class="zh"><span class="lang-label">中文</span><p>分子是 backlog 的总 block-time，分母是获得的并行 KV block 容量，商可以理解为“这类 backlog 需要多久消化”。按 R 比例分配时，各类 τ 大致相等：长期占用更久的类会获得更大预算。</p></div></article><article class="equation"><div class="equation-head"><b>Time-weighted quota and cap / 时间加权配额与 cap</b><span class="eq-no">(13)</span></div><div class="formula">M<sup>time</sup><sub>w,b</sub> = C<sub>w</sub> · <span class="frac">R<sub>w,b</sub> / Σ<sub>b′</sub>R<sub>w,b′</sub></span><br>K<sup>time</sup><sub>w,b</sub> = max{1, ⌊M<sup>time</sup><sub>w,b</sub> / k̄<sub>b</sub>⌋}</div><div class="equation-body dual"><div class="en"><span class="lang-label">English</span><p>Backlog, footprint and residency jointly determine the protected share. T̂ affects the budget share only; k̄ converts allocated blocks back to a session cap.</p></div><div class="zh"><span class="lang-label">中文</span><p>积压越多、KV 越大、驻留越久，得到的 protected quota 越多；backlog 被消化后份额自然下降。注意 T̂ 只影响预算份额，最后仍用 k̄ 把 blocks 换回 session 数，避免单位混乱。例：Agent 与 RLVR 都需求 500 blocks，但驻留 20s/5s，则 block-time 比 4:1，1,000 blocks 大致按 800/200 分配。</p></div></article></div>
+        <h3>4.4 Session-level cache accounting / Session 级 Cache 记账</h3>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>The router receives two complementary cache views. A session snapshot records running and recently completed sessions, estimated total and cached KV blocks, lifecycle timestamps and instance capacity. Prefix location is tracked separately through block hashes from the inference engine. Longest matching prompt-block hash determines reusable prefix on each instance; eviction or reset removes the hash mapping.</p></div><div class="zh"><span class="lang-label">中文对照</span><p>Router 使用两种互补视图：session snapshot 记录 running/recently completed sessions、total/cached KV blocks、生命周期时间戳和实例容量；prefix location 则由 inference engine 产生的 block hash 单独维护。对 incoming request，最长匹配的 prompt-block hash 决定各实例可复用的前缀；发生 eviction 或 cache reset 时删除映射。</p></div></div>
+        <h3>4.5 Implementation summary / 实现摘要</h3><p>MISA-T 可以是独立 scheduler，也可以与 serving gateway colocate。它先用 runtime metrics、session snapshots 和 workload metadata 过滤实例，之后让已有 cache-aware placement policy 在有 admission headroom 的实例中选择目标。它与模型执行、物理 cache 管理和 agent runtime 解耦。</p>
+      </section>
+
+      <section id="experiments">
+        <p class="section-label">5 Evaluation</p>
+        <h2>5 · Evaluation / 实验</h2>
+        <h3>Evaluation questions / 实验问题</h3>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>The evaluation asks: (1) Can adaptive admission prevent prefix-hit collapse under high rollout concurrency? (2) Do workload-aware caps and residency-time weighting improve efficiency beyond class-agnostic admission? (3) Do serving gains reduce end-to-end iteration time while preserving the trainer-defined mixture?</p></div><div class="zh"><span class="lang-label">中文对照</span><p>实验回答三个问题：(1) 自适应 admission 能否防止高并发下 prefix hit 崩溃？(2) workload-aware cap 和 residency-time weighting 是否优于 class-agnostic admission？(3) serving 提升能否降低端到端 iteration time，同时保持 trainer 定义的 mix？</p></div></div>
+        <h3>5.1 Experimental setup / 实验设置</h3>
+        <table><thead><tr><th>实验</th><th>配置</th><th>目的</th></tr></thead><tbody><tr><td>End-to-end RL</td><td>Step3.7 196B-A11B sparse-MoE；6 个 H200 training nodes；4 个 H200 rollout nodes；每个 inference node 一个 TP=8 replica；50 iterations</td><td>在真实训练 horizon 比较 iteration time、mix 和 task score</td></tr><tr><td>Rollout-only</td><td>Step3.7：2 个 H200 inference nodes，TP=8；Qwen3.6-35B-A3B：16 个 H100，4 个 TP=4 replicas；每项 3 次独立运行取算术平均</td><td>固定 checkpoint，隔离 serving scheduler，排除权重同步与 cache reset</td></tr><tr><td>Baseline sweep</td><td>Step3.7 static concurrency 以 32 为步长，最佳 128；Qwen 以 16 为步长，最佳 48</td><td>给 vLLM Router 一个 sweep-tuned operating point</td></tr></tbody></table>
+        <p>比较的四个策略是：<b>vLLM Router</b>（cache-aware placement，无 admission）；<b>Session Admission</b>（class-agnostic global cap，保护 continuation）；<b>MISA</b>（加入 workload-specific cap）；<b>MISA-T</b>（再加入 class-level residency-time weighting）。</p>
+        <h3>Metrics / 指标口径</h3><p>RPM 是成功 inference requests per minute；rollout throughput 是每分钟返回 trainer 的完整 rollout samples；prefix hit rate 是查询的 prompt tokens 中命中 prefix cache 的比例；prefill TPS 是包含 prefix-hit tokens 的 effective prompt-token throughput；decode TPS 是生成侧吞吐。作者把 rollout-only 与 end-to-end 分开报告，因为 weight synchronization 会 reset 并重新 warm prefix cache。</p>
+        <h3>5.2 End-to-end training results / 端到端训练结果</h3>
+        <div class="metric-grid"><div class="metric"><b>+35.6%</b><span>rollout sample rate / rollout 吞吐</span></div><div class="metric"><b>−22.8%</b><span>mean iteration time / 平均迭代时间</span></div><div class="metric"><b>96.2%</b><span>prefix hit，baseline 74.5%</span></div></div>
+        <table><thead><tr><th>Change vs baseline</th><th>vLLM Router</th><th>MISA-T</th></tr></thead><tbody><tr><td>Iteration time</td><td>0.0%</td><td>−22.8%</td></tr><tr><td>RPM</td><td>0.0%</td><td>+32.5%</td></tr><tr><td>Sample rate</td><td>0.0%</td><td>+35.6%</td></tr><tr><td>Prefill TPS</td><td>0.0%</td><td>+33.6%</td></tr><tr><td>Decode TPS</td><td>0.0%</td><td>+38.0%</td></tr><tr><td>Prefix hit</td><td>74.5%</td><td>96.2%</td></tr></tbody></table>
+        <p>目标 Agent/RLVR/RLHF mix 为 48.6/33.1/18.2%；50 次迭代实际消耗 mix 为 vLLM Router 的 48.3/29.4/22.4%，MISA-T 的 45.9/33.3/20.8%。DTV 从 4.14 降至 2.71 个百分点。SWE-Pro、SWE-Verified 和 SWE-MTLG 的 pass@4 绝对差低于 0.5 个百分点。这里的结论是 serving 层加速没有观察到明显 task-score 损失，并不意味着 MISA-T 改进了 RL objective。</p>
+        <h3>5.3 Rollout-only ablation / Rollout-only 消融</h3>
+        <table><thead><tr><th>Model / Policy</th><th>Sample rate</th><th>RPM</th><th>Prefill TPS</th><th>Decode TPS</th><th>Prefix hit</th></tr></thead><tbody><tr><td>Step3.7 · Router sweep</td><td>0.0%</td><td>0.0%</td><td>0.0%</td><td>0.0%</td><td>95.9%</td></tr><tr><td>Step3.7 · Session Admission</td><td>+11.7%</td><td>+22.7%</td><td>+20.5%</td><td>+16.8%</td><td>97.1%</td></tr><tr><td>Step3.7 · MISA</td><td>+23.3%</td><td>+28.8%</td><td>+25.4%</td><td>+19.8%</td><td>97.3%</td></tr><tr><td><b>Step3.7 · MISA-T</b></td><td><b>+53.3%</b></td><td>+45.5%</td><td>+40.4%</td><td>+26.5%</td><td>97.8%</td></tr><tr><td>Qwen · Router sweep</td><td>0.0%</td><td>0.0%</td><td>0.0%</td><td>0.0%</td><td>92.4%</td></tr><tr><td>Qwen · Session Admission</td><td>+19.3%</td><td>+23.7%</td><td>+23.4%</td><td>+7.8%</td><td>96.3%</td></tr><tr><td>Qwen · MISA</td><td>+30.9%</td><td>+28.9%</td><td>+30.2%</td><td>+12.3%</td><td>79.2%</td></tr><tr><td><b>Qwen · MISA-T</b></td><td><b>+43.6%</b></td><td>+37.5%</td><td>+36.5%</td><td>+18.3%</td><td>95.3%</td></tr></tbody></table>
+        <p>相对 Session Admission，MISA 在 Step3.7 和 Qwen 上分别再提高 10.4% 和 9.7%；加上 residency weighting 后，MISA-T 相对 MISA 在两者分别再提高 24.3% 和 9.7%。这正好对应三层机制的逐步增益。Qwen 的 MISA prefix hit 为 79.2%，但 MISA-T 恢复到 95.3%，说明只看空间而忽略 residency time 可能分错容量。</p>
+        <h3>5.4 Controller behavior / Controller 行为</h3><p>Figure 4 中，base cap 跟随 moving session-length reference；current cap 负责实际 new-session gate。当确认的 prefix-hit degradation 表明长度参考落后于当前 demand 时，controller 暂时降低 current cap。长尾 session growth 会让早期 correction 更频繁；随着 completed-session observations 更新 reference，caps 逐渐对齐，pressure window 变少。</p>
+        <h3>5.5 Compatibility with CPU KV offloading / 与 CPU KV offloading 兼容</h3><div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>The CPU tier has 1.3 TB KV capacity and keeps a backup copy of GPU-resident state. MISA-T continues to control logical session admission while the offloading layer manages physical copies. After warm-up, GPU KV usage stays close to or above 90% for most of steady state, and mean per-replica RPM improves by 35.6%.</p></div><div class="zh"><span class="lang-label">中文对照</span><p>CPU tier 配置 1.3 TB KV capacity，保存 GPU 上状态的 backup copy。MISA-T 继续控制 logical session admission；offloading layer 负责 physical copies。warm-up 后，稳态大部分时间 GPU KV usage 接近或高于 90%，平均每 replica RPM 提高 35.6%。说明 admission control 和物理 offloading 位于互补层次。</p></div></div>
+      </section>
+
+      <section id="discussion">
+        <p class="section-label">6 Discussion</p>
+        <h2>6 · Discussion / 讨论</h2>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">Adaptive admission versus static concurrency</span><p>MISA-T retains the outer rollout-concurrency limit and does not seek a globally optimal outer limit. It reduces reliance on repeated static-concurrency searches as sequence lengths, residency patterns, serving demand and model checkpoints change.</p></div><div class="zh"><span class="lang-label">自适应准入 vs. 静态并发</span><p>MISA-T 保留 outer rollout-concurrency limit，并不声称找到了全局最优的外层并发。它的目标是：当 sequence length、residency pattern、serving demand 或 checkpoint 变化时，不必反复做静态 concurrency sweep。</p></div></div>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">Compatibility with KV offloading</span><p>KV-offloading systems extend effective capacity by moving selected KV state outside GPU memory. MISA-T and offloading act at complementary layers: the router controls logical admission, while offloading determines whether reusable KV resides on GPU or CPU.</p></div><div class="zh"><span class="lang-label">与 KV offloading 的关系</span><p>KV offloading 通过把选定 KV 移出 GPU 来扩大有效容量。MISA-T 和 offloading 位于互补层：router 控制 logical session admission，offloading 决定 reusable KV 物理上放在 GPU 还是 CPU。</p></div></div>
+        <div class="callout warning"><strong>本文的实际边界：</strong>方法假设请求带有正确 workload label，并依赖及时的 serving-state report。标签错误、snapshot 延迟或信息不完整，会让 KV-demand estimate 和 admission cap 暂时失准。实验只覆盖两个模型家族和有限硬件/trace，不能自动外推到所有拓扑和 workload shift。</div>
+      </section>
+
+      <section id="conclusion">
+        <p class="section-label">7 Conclusion</p>
+        <h2>7 · Conclusion / 结论</h2>
+        <div class="paper-block dual"><div class="en"><span class="lang-label">English</span><p>Mixed RL rollout serving requires more than prefix-aware instance selection. The routing layer must control how many sessions compete for KV capacity and allocate protected capacity across workloads with different KV footprints and residency times, while leaving the target workload mixture under trainer control. MISA-T addresses these requirements with adaptive session admission, workload-aware session caps and residency-time-aware KV accounting.</p><p>The authors report up to 53.3% and 43.6% rollout-throughput improvements over sweep-tuned vLLM Router on Step3.7 and Qwen3.6-35B-A3B, respectively; in matched Step3.7 training, throughput improves 35.6%, mean iteration time falls 22.8%, and mixture deviation decreases from 4.14 to 2.71 percentage points.</p></div><div class="zh"><span class="lang-label">中文对照</span><p>混合 RL rollout serving 不能只做 prefix-aware instance selection。Routing layer 还必须控制有多少 session 竞争 KV 容量，并根据不同 workload 的 KV footprint 和 residency time 分配 protected capacity，同时把目标 workload mix 留在 trainer 手里。MISA-T 通过 adaptive session admission、workload-aware session cap 和 residency-time-aware KV accounting 来处理这些要求。</p><p>作者报告：相对 sweep-tuned vLLM Router，Step3.7 和 Qwen3.6-35B-A3B 的 rollout throughput 分别提高 53.3% 和 43.6%；匹配的 Step3.7 训练中，吞吐提高 35.6%，平均 iteration time 降低 22.8%，mix deviation 从 4.14 降到 2.71 个百分点。</p></div></div>
+      </section>
+
+      <section id="references">
+        <p class="section-label">References / 参考文献</p>
+        <h2>References · 本文引用与补充阅读</h2>
+        <p class="lead">下面按原论文 References 的顺序列出全部 25 条文献。每条包含标题、链接、英文摘要式说明和中文对应；没有在原文给出 arXiv 编号的会议论文，链接使用 arXiv 标题检索页。</p>
+        <div class="refs">
+          <article class="ref"><h3>1. <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noreferrer">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></h3><div class="ref-meta">Woosuk Kwon et al. · SOSP 2023 · <span class="tag">KV memory</span></div><p><b>EN:</b> PagedAttention partitions KV cache into manageable blocks, reducing fragmentation and enabling sharing. <b>中:</b> 将 KV 切成可管理 blocks，降低碎片并支持共享，是本文 protected KV accounting 的底层内存抽象。</p></article>
+          <article class="ref"><h3>2. <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noreferrer">SGLang: Efficient Execution of Structured Language Model Programs</a></h3><div class="ref-meta">Lianmin Zheng et al. · NeurIPS 2024 · <span class="tag">RadixAttention</span></div><p><b>EN:</b> RadixAttention reuses KV prefixes across structured generation calls. <b>中:</b> 说明多轮、结构化 LLM program 可以通过前缀复用减少重复 prefill。</p></article>
+          <article class="ref"><h3>3. <a href="https://arxiv.org/search/?query=InfiniGen%3A+Efficient+generative+inference+of+large+language+models+with+dynamic+KV+cache+management&amp;searchtype=title" target="_blank" rel="noreferrer">InfiniGen: Efficient Generative Inference of Large Language Models with Dynamic KV Cache Management</a></h3><div class="ref-meta">Wei Lee et al. · OSDI 2024 · <span class="tag">KV management</span></div><p><b>EN:</b> Dynamic KV management improves long-context generative inference. <b>中:</b> 代表把 KV cache 当作动态资源管理的系统工作；本文在讨论 offloading 与 cache residency 时补充引用它。</p></article>
+          <article class="ref"><h3>4. <a href="https://arxiv.org/search/?query=ShadowKV%3A+KV+cache+in+shadows+for+high-throughput+long-context+LLM+inference&amp;searchtype=title" target="_blank" rel="noreferrer">ShadowKV: KV Cache in Shadows for High-throughput Long-context LLM Inference</a></h3><div class="ref-meta">Hanshi Sun et al. · ICML 2025 · <span class="tag">long context</span></div><p><b>EN:</b> Explores a high-throughput design that manages long-context KV efficiently. <b>中:</b> 说明物理 KV 管理可以独立于路由 admission 演进，与 MISA-T 的分层设计相容。</p></article>
+          <article class="ref"><h3>5. <a href="https://github.com/vllm-project/router" target="_blank" rel="noreferrer">vLLM Router: A High-performance and Light-weight Router for vLLM Large-scale Deployment</a></h3><div class="ref-meta">vLLM Project · 2026 · <span class="tag">baseline</span></div><p><b>EN:</b> A cache-aware router for placement in large-scale vLLM deployments. <b>中:</b> 本文的主要 baseline：偏好 prefix match，但不限制新 session admission。</p></article>
+          <article class="ref"><h3>6. <a href="https://arxiv.org/search/?query=AReaL%3A+A+large-scale+asynchronous+reinforcement+learning+system+for+language+reasoning&amp;searchtype=title" target="_blank" rel="noreferrer">AReaL: A Large-scale Asynchronous Reinforcement Learning System for Language Reasoning</a></h3><div class="ref-meta">Wei Fu et al. · NeurIPS 2025 · <span class="tag">async RL</span></div><p><b>EN:</b> Overlaps rollout generation with training in a large-scale asynchronous RL system. <b>中:</b> 说明 rollout 已是持续在线的生成负载，trainer 与 serving 需要异步协同。</p></article>
+          <article class="ref"><h3>7. <a href="https://arxiv.org/abs/2511.00796" target="_blank" rel="noreferrer">AReaL-Hex: Accommodating Asynchronous RL Training over Heterogeneous GPUs</a></h3><div class="ref-meta">Ran Yan et al. · 2025 · <span class="tag">heterogeneous GPU</span></div><p><b>EN:</b> Extends asynchronous RL coordination to heterogeneous accelerators. <b>中:</b> 支撑本文把 trainer release、serving admission 和设备差异视为不同控制层。</p></article>
+          <article class="ref"><h3>8. <a href="https://arxiv.org/abs/2604.26256" target="_blank" rel="noreferrer">DORA: A Scalable Asynchronous Reinforcement Learning System for Language Model Training</a></h3><div class="ref-meta">Tianhao Hu et al. · 2026 · <span class="tag">async training</span></div><p><b>EN:</b> A scalable asynchronous RL architecture for language-model training. <b>中:</b> 代表 MISA-T 需要兼容的上层 rollout controller 形态。</p></article>
+          <article class="ref"><h3>9. <a href="https://arxiv.org/abs/2507.19766" target="_blank" rel="noreferrer">UloRL: An Ultra-long Output Reinforcement Learning Approach for Advancing LLM Reasoning Abilities</a></h3><div class="ref-meta">Dong Du et al. · 2025 · <span class="tag">long output</span></div><p><b>EN:</b> Uses ultra-long outputs to advance reasoning abilities. <b>中:</b> 支撑 RLVR 的典型画像：短输入、长 decode tail、KV 在生成中不断增长。</p></article>
+          <article class="ref"><h3>10. <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noreferrer">Training Language Models to Follow Instructions with Human Feedback</a></h3><div class="ref-meta">Long Ouyang et al. · NeurIPS 2022 · <span class="tag">RLHF</span></div><p><b>EN:</b> Establishes the SFT, reward-model and PPO-style RLHF pipeline. <b>中:</b> 作为输入输出长度相对均衡的 RLHF workload 背景。</p></article>
+          <article class="ref"><h3>11. <a href="https://arxiv.org/abs/2606.30560" target="_blank" rel="noreferrer">TraceLab: Characterizing Coding Agent Workloads for LLM Serving</a></h3><div class="ref-meta">Kan Zhu et al. · 2026 · <span class="tag">agent trace</span></div><p><b>EN:</b> Characterizes multi-turn coding-agent calls, tools and long-context reuse. <b>中:</b> 支撑 Agent 的长前缀连续性和 tool gap 会改变 KV residency。</p></article>
+          <article class="ref"><h3>12. <a href="https://arxiv.org/abs/2505.24871" target="_blank" rel="noreferrer">MoDoMoDo: Multi-domain Data Mixtures for Multimodal LLM Reinforcement Learning</a></h3><div class="ref-meta">Yiqing Liang et al. · 2025 · <span class="tag">multi-domain mix</span></div><p><b>EN:</b> Studies multi-domain data mixtures in multimodal LLM RL. <b>中:</b> 说明 trainer 可能有明确的异构 workload distribution，serving 不应私自改写。</p></article>
+          <article class="ref"><h3>13. <a href="https://arxiv.org/abs/2606.30406" target="_blank" rel="noreferrer">MOPD: Multi-Teacher On-Policy Distillation for Capability Integration in LLM Post-Training</a></h3><div class="ref-meta">Wenhan Ma et al. · 2026 · <span class="tag">multi-teacher</span></div><p><b>EN:</b> Generates student rollouts from multi-domain prompts and routes trajectories to matching teachers. <b>中:</b> 直接产生共享 inference pool 的 mixed rollout 流。</p></article>
+          <article class="ref"><h3>14. <a href="https://arxiv.org/abs/2602.12125" target="_blank" rel="noreferrer">Learning beyond Teacher: Generalized On-Policy Distillation with Reward Extrapolation</a></h3><div class="ref-meta">Wenkai Yang et al. · 2026 · <span class="tag">distillation</span></div><p><b>EN:</b> Uses reward extrapolation to go beyond a teacher's capability boundary. <b>中:</b> 代表 on-policy distillation 在 post-training 中不断扩展的方向。</p></article>
+          <article class="ref"><h3>15. <a href="https://arxiv.org/abs/2603.27703" target="_blank" rel="noreferrer">KAT-Coder-V2 Technical Report</a></h3><div class="ref-meta">Fengxiang Li et al. · 2026 · <span class="tag">code model</span></div><p><b>EN:</b> Reports a code-oriented model and post-training line. <b>中:</b> 作为多教师、跨领域能力整合的代码领域案例。</p></article>
+          <article class="ref"><h3>16. <a href="https://arxiv.org/abs/2601.02780" target="_blank" rel="noreferrer">MiMo-V2-Flash Technical Report</a></h3><div class="ref-meta">Xiaomi LLM-Core Team · 2026 · <span class="tag">post-training</span></div><p><b>EN:</b> Describes the model and post-training recipe for MiMo-V2-Flash. <b>中:</b> 体现多领域 on-policy 能力整合已进入真实训练流程。</p></article>
+          <article class="ref"><h3>17. <a href="https://arxiv.org/abs/2607.24653" target="_blank" rel="noreferrer">Kimi K3: Open Frontier Intelligence</a></h3><div class="ref-meta">Kimi Team · 2026 · <span class="tag">specialists</span></div><p><b>EN:</b> Describes frontier intelligence built across domain and reasoning-effort specialists. <b>中:</b> 说明不同专家会在同一 post-training serving pool 中形成异构负载。</p></article>
+          <article class="ref"><h3>18. <a href="https://arxiv.org/abs/2505.09388" target="_blank" rel="noreferrer">Qwen3 Technical Report</a></h3><div class="ref-meta">An Yang et al. · 2025 · <span class="tag">Qwen3</span></div><p><b>EN:</b> Reports Qwen3's model and post-training pipeline. <b>中:</b> 本文 Qwen3.6-35B-A3B 实验所处的多能力模型背景。</p></article>
+          <article class="ref"><h3>19. <a href="https://arxiv.org/abs/2606.15007" target="_blank" rel="noreferrer">Nemotron 3 Ultra: Open, Efficient Mixture-of-Experts Hybrid Mamba-Transformer Model for Agentic Reasoning</a></h3><div class="ref-meta">NVIDIA · 2026 · <span class="tag">agentic reasoning</span></div><p><b>EN:</b> Presents an open MoE hybrid model for agentic reasoning. <b>中:</b> 作为 agentic reasoning 和混合 rollout 成为产业需求的背景案例。</p></article>
+          <article class="ref"><h3>20. <a href="https://arxiv.org/abs/2603.19220" target="_blank" rel="noreferrer">Nemotron-Cascade 2: Post-training LLMs with Cascade RL and Multi-domain On-policy Distillation</a></h3><div class="ref-meta">Zhuolin Yang et al. · 2026 · <span class="tag">Cascade RL</span></div><p><b>EN:</b> Combines cascade RL with multi-domain on-policy distillation. <b>中:</b> 直接展示多个训练阶段、domain 和 teacher workload 的汇合。</p></article>
+          <article class="ref"><h3>21. <a href="https://arxiv.org/abs/2605.12652" target="_blank" rel="noreferrer">Multi-rollout On-policy Distillation via Peer Successes and Failures</a></h3><div class="ref-meta">Weichen Yu et al. · 2026 · <span class="tag">group rollout</span></div><p><b>EN:</b> Generates multiple rollouts per prompt and uses peer successes/failures for distillation. <b>中:</b> 带来 group-completion dependency，所以完整 rollout throughput 不等同于 request RPM。</p></article>
+          <article class="ref"><h3>22. <a href="https://arxiv.org/abs/2602.13692" target="_blank" rel="noreferrer">ThunderAgent: A Fast, Simple, and Program-aware Agentic Inference System</a></h3><div class="ref-meta">Hao Kang et al. · ICML 2026 · <span class="tag">agent serving</span></div><p><b>EN:</b> Uses program-aware scheduling for agentic inference and tool-interleaved workflows. <b>中:</b> 说明多轮状态、工具间隔和 workflow 生命周期会共同决定 serving resource。</p></article>
+          <article class="ref"><h3>23. <a href="https://arxiv.org/search/?query=Preble%3A+Efficient+distributed+prompt+scheduling+for+LLM+serving&amp;searchtype=title" target="_blank" rel="noreferrer">Preble: Efficient Distributed Prompt Scheduling for LLM Serving</a></h3><div class="ref-meta">Vikranth Srivatsa et al. · ICLR 2025 · <span class="tag">distributed routing</span></div><p><b>EN:</b> Balances distributed prefix reuse with load. <b>中:</b> 是“placement 很聪明但仍缺 admission controller”这一研究缺口的前置工作。</p></article>
+          <article class="ref"><h3>24. <a href="https://arxiv.org/abs/2501.14312" target="_blank" rel="noreferrer">Locality-aware Fair Scheduling in LLM Serving</a></h3><div class="ref-meta">Shiyi Cao et al. · 2025 · <span class="tag">fair scheduling</span></div><p><b>EN:</b> Adds fairness constraints to locality-aware scheduling. <b>中:</b> 与本文共同关注 locality 的公平性，但 MISA-T 的单位进一步变成 workload-class KV block-time。</p></article>
+          <article class="ref"><h3>25. <a href="https://arxiv.org/search/?query=LLM+query+scheduling+with+prefix+reuse+and+latency+constraints&amp;searchtype=title" target="_blank" rel="noreferrer">LLM Query Scheduling with Prefix Reuse and Latency Constraints</a></h3><div class="ref-meta">Gregory Dexter et al. · NeurIPS 2025 · <span class="tag">latency</span></div><p><b>EN:</b> Incorporates latency constraints into prefix-reuse query scheduling. <b>中:</b> 说明 locality 不能脱离 latency 目标；本文把这一思路延伸到 session admission 和 residency time。</p></article>
+        </div>
+        <div class="callout plain"><strong>阅读提示：</strong>文献链接优先使用原论文给出的 arXiv 编号或官方仓库；InfiniGen、ShadowKV、AReaL、Preble 和 k-LPM 的原文参考条目没有提供 arXiv 编号，因此链接到按标题检索的 arXiv 页面。</div>
+      </section>
+
+      <footer><p>This page follows the source paper's order. / 本页按原论文顺序整理。公式和数值来自 arXiv:2608.11152v1；中英文解释是阅读辅助，不替代原文的 formal definition。</p></footer>
+    </main>
+  </div>
+
+  <script>
+    const bar = document.getElementById('progressBar');
+    const links = [...document.querySelectorAll('.toc a')];
+    const sections = [...document.querySelectorAll('main section[id]')];
+    function updateProgress() {
+      const max = document.documentElement.scrollHeight - window.innerHeight;
+      bar.style.width = (max > 0 ? window.scrollY / max * 100 : 0) + '%';
+    }
+    const observer = new IntersectionObserver((entries) => {
+      const visible = entries.filter(e => e.isIntersecting).sort((a, b) => b.intersectionRatio - a.intersectionRatio)[0];
+      if (!visible) return;
+      links.forEach(link => link.classList.toggle('active', link.getAttribute('href') === '#' + visible.target.id));
+    }, { rootMargin: '-20% 0px -65% 0px', threshold: [0, 0.2, 0.5] });
+    sections.forEach(section => observer.observe(section));
+    window.addEventListener('scroll', updateProgress, { passive: true });
+    document.getElementById('printBtn').addEventListener('click', () => window.print());
+    updateProgress();
+  </script>
+</body>
+</html>

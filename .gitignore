@@ -28,3 +28,8 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Tool/editor working dirs
+.obsidian/
+.pdf-tools/
+.ai-pending/
