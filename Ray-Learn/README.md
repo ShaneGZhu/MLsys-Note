@@ -59,9 +59,13 @@ dist = ["torch>=2.4"]
 ### 3. 同步环境
 
 ```bash
-uv sync                      # 只装 ray，够 L01–L05 用
+uv sync                      # 只装 ray，够 L01–L05/L08/L09 用
 uv sync --extra dist         # 加 torch，给 L06 用
 ```
+
+> ⭐ **本课程本机跑的是 Ray `2.58.0`（Python 3.14）**，`uv.lock` 已钉住。
+> ⚠️ 这个版本号要记住：**L02 Part B（Ray 挑哪几张卡）和 L04（actor 崩了抛什么）的行为随版本变**，
+> 你实测到的结论只在**这个版本**上成立。换版本请重测那两处，并把观察结果记在 lesson 末尾。
 
 `uv sync` 会自己下载合适的 Python、建 `.venv/`、写出 `uv.lock`。**`uv.lock` 要提交**——它是这个学习环境可复现的凭据。
 
