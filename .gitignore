@@ -33,3 +33,11 @@ Thumbs.db
 .obsidian/
 .pdf-tools/
 .ai-pending/
+
+# Python / uv（Ray-Learn 引入）
+.venv/
+__pycache__/
+*.py[cod]
+.python-version
+# ⚠️ uv.lock 是【故意不忽略】的 —— 它是这个学习环境可复现的凭据
+

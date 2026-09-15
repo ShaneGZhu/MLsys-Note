@@ -1,0 +1,13 @@
+[project]
+name = "ray-learn"
+version = "0.1.0"
+description = "Ray lessons scoped to the Lux orchestration layer"
+requires-python = ">=3.11"
+dependencies = [
+    # [default] 带 dashboard —— 学 L02/L03 时「看见」资源与 bundle 比读日志快得多
+    "ray[default]>=2.40",
+]
+
+[project.optional-dependencies]
+# 只有 L06（torch 进程组）需要；前 5 课不用装 torch
+dist = ["torch>=2.4"]
