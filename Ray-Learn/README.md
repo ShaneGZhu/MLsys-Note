@@ -121,7 +121,7 @@ ray.init(resources={"fake_gpu": 4})
 | 课 | 学什么 | 关键 Ray API | 解锁 Lux 的哪一块 | 硬件 | 建议 |
 | --- | --- | --- | --- | --- | --- |
 | [L01](lessons/01-actor-model.md) | task vs actor、ObjectRef、有状态 | `@ray.remote` / `.remote()` / `ray.get` | 一切的基础 | 单卡即可 | 必做 |
-| [L02](lessons/02-resource-ledger.md) | **资源账本**：超额会排队；⭐ **Part B：账本 vs 实际占用** | `num_gpus` / `ray start --num-gpus` / `cluster_resources()` | S0 #17（GPU 记账 = 16 不是 32） | **1 台 × 8 卡** | ⭐⭐ 必做（含 Part B） |
+| [L02](lessons/02-resource-ledger.md) | **资源账本** + ⭐⭐ **task 排队 vs actor 永久挂死**；Part B：账本 vs 实际占用 | `num_gpus` / `ray start --num-gpus` / `cluster_resources()` | S0 #17（GPU 记账 = 16 不是 32） | **1 台 × 8 卡** | ⭐⭐ 必做（三部分都做） |
 | [L03](lessons/03-placement-group.md) | **PG 与 bundle**：gang scheduling、位置确定、重排序 | `placement_group` / `PlacementGroupSchedulingStrategy` | 训练 rank 的稳定性 | 1 台 × 8 卡 | ⭐ 必做 |
 | [L04](lessons/04-named-actor.md) | 具名 actor、namespace、**死掉以后什么样** | `name=` / `namespace=` / `get_actor` / `ray.kill` | `LuxDriver`、故障恢复 | 单卡即可 | 必做 |
 | [L05](lessons/05-sync-vs-async.md) | **饿死实验**：为什么阻塞一个 actor 会拖死全部 | `max_concurrency` / async actor | ⭐ **`rollout` 为什么必须独立** | **无需 GPU** | ⭐⭐ 最重要 |
@@ -130,7 +130,7 @@ ray.init(resources={"fake_gpu": 4})
 
 **顺序不能换**：L02 是 L03 的前提，L04 是 L05 的前提，L06 是 L07 的前提。
 
-⭐ **如果时间有限，只做三课**：**L02 Part B**（复现最危险的静默失效）、
+⭐ **如果时间有限，只做三课**：**L02 Part A2 + Part B**（actor 超额永久挂死 + 复现最危险的静默失效）、
 **L05**（解释 Lux 一个已定版架构决策）、**L03 实验 4**（rank↔GPU 稳定性，是正确性问题）。
 
 ### 每课的固定结构
