@@ -127,11 +127,17 @@ ray.init(resources={"fake_gpu": 4})
 | [L05](lessons/05-sync-vs-async.md) | **饿死实验**：为什么阻塞一个 actor 会拖死全部 | `max_concurrency` / async actor | ⭐ **`rollout` 为什么必须独立** | **无需 GPU** | ⭐⭐ 最重要 |
 | [L06](lessons/06-rendezvous.md) | 手工 rendezvous + **NCCL** 进程组 | `get_node_ip_address` + `init_process_group` + `NCCL_DEBUG` | 16 个 `TrainActor` 组成 PG | 1 台 × 8 卡 | 必做 |
 | [L07](lessons/07-multinode.md) | 多机集群：`ray start`、`--num-gpus`、GLOO | `ray start --head/--address` / `ray status` | **S0 阶段 0.1** | **4 台** | 上机时做 |
+| [L08](lessons/08-gpu-identity.md) | ⭐ **`ray.get_gpu_ids()`** + `InfoActor` 探测 + **bundle 重排序** | `ray.get_gpu_ids` / `PlacementGroup` 探测 | 「rank↔GPU 稳定」的**实现手段** | 1 台 × 8 卡 | ⭐ 必做（补 L03 的另一半） |
+| [L09](lessons/09-env-and-lock.md) | ⭐ **环境变量注入**（3 条必须照抄）+ 24 行分布式锁 | `runtime_env` / `@ray.remote class Lock` | `config.py` 启动期；版本屏障 | 任意机器 | ⭐ 必做 |
 
-**顺序不能换**：L02 是 L03 的前提，L04 是 L05 的前提，L06 是 L07 的前提。
+**顺序不能换**：L02 是 L03 的前提，L04 是 L05 的前提，L06 是 L07 的前提，**L03 是 L08 的前提**。
+
+> 📌 **L08/L09 是后补的**。初版只有 7 课，按 slime 编排层实际用到的 Ray API 对账后发现
+> **漏了 `ray.get_gpu_ids()`（用了 3 次）、环境变量注入（一整个 `utils.py`）、分布式锁**——
+> 而这三样恰恰是「rank↔GPU 稳定」和「启动期正确性」的实现手段。补课记录见 commit 历史。
 
 ⭐ **如果时间有限，只做三课**：**L02 Part A2 + Part B**（actor 超额永久挂死 + 复现最危险的静默失效）、
-**L05**（解释 Lux 一个已定版架构决策）、**L03 实验 4**（rank↔GPU 稳定性，是正确性问题）。
+**L05**（解释 Lux 一个已定版架构决策）、**L08**（rank↔GPU 稳定的实现手段）。
 
 ### 每课的固定结构
 
