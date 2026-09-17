@@ -1,179 +1,212 @@
-# L07 · 多机集群：起 Ray，并断言 GPU 账本是 16 不是 32
+# L07 · 把 4 个节点**全部**交给 Ray（32 张卡）
 
-> ⚠️ **本课必须上真集群**（Lux 目标：4 节点 × 8×H100）。单机无法替代——本课的核心现象
-> "跨节点分布"和"GPU 账本"在单节点上根本不会出现。
+> 🖥️ **需要 4 台 H100**（2 训 + 2 推）。本课是唯一无法在单机上完成的课。
 
-> 🖥️ **需要 4 台 H100 机器**（2 训 + 2 推）。这是本课程唯一无法在单机上完成的课。
+> ⚠️⚠️ **2026-09 设计变更——本课的前提整个反了。**
+> | | 旧设计 | **新设计** |
+> | --- | --- | --- |
+> | 推理节点的 16 张卡 | **不进** Ray 账本（`--num-gpus=0`） | ⭐ **进**账本（`--num-gpus=8`） |
+> | 主要风险 | Ray 看不见推理卡 | ⚠️ **Ray 把 `TrainActor` 放到推理卡上** |
+> | 靠什么防 | 藏起来 | ⭐ **用自定义资源给节点打角色 + 写进 bundle 规格** |
+>
+> ⇒ **"少报卡"这个手段不再适用**。新设计下 Ray 有能力把训练放到任何地方，
+> **必须显式约束**。（旧版这一课教的是 `--num-gpus=0`，与现行设计相反，已整体重写。）
 
 ## ① 一句话目标
 
-把 4 个节点组成一个 Ray 集群，并**用一个断言确认账本是对的**：
-**GPU 总数必须是 16，不是 32**。
+起一个 4 节点 / 32 卡的 Ray 集群，并让 Ray **只把训练放训练节点、只把引擎放推理节点**。
 
 ## ② 先预测
 
-Lux 的 4 个节点：**2 个训练节点 + 2 个推理节点**，每个节点 8 张 H100。
+Ray 现在看得见全部 32 张卡。
 
-问题：`ray status` 里的 `GPU` 总数应该是多少？
-
-- A. 32（4 节点 × 8 卡）
-- B. **16**（只有训练节点那 16 张）
-- C. 0（Ray 不会自动发现）
-
-> 提示：**上一课（[L02](02-resource-ledger.md)）已经给了答案**——Ray 的资源是**声明式账本**。
-> 但这个答案在真集群上的**后果**，只有本课能看到。
+1. 它怎么知道哪 16 张该放训练、哪 16 张该放引擎？
+2. 如果什么都不做，会怎样？
+3. `--num-gpus=8` 在推理节点上意味着什么？
 
 ## ③ 步骤
 
-### 3.1 先想清楚：为什么推理节点的 GPU 不能入账
+### 3.1 ⭐ 节点角色 = **自定义资源**（新设计的核心机制）
 
-| | 谁拉起 | 用哪 8 张卡 | 进 Ray 账本吗 |
-| --- | --- | --- | --- |
-| **训练节点 ×2** | `TrainActor`（Ray actor） | Ray 分配 | ✅ **进**（`num_gpus=1` × 16） |
-| **推理节点 ×2** | **Dynamo 自己拉起 SGLang 引擎** | `CUDA_VISIBLE_DEVICES` 直接占 | ❌ **不进** |
+`ray start --resources` 收一个 JSON。我们用它给节点"贴标签"：
 
-⇒ **如果推理节点带着 8 张卡 join Ray，Ray 会以为自己有 32 张**，
-于是**可能把 `TrainActor` 调度到推理节点上**——那张卡上正跑着 SGLang 引擎。
+```
+--resources='{"train_node": 8}'     # 训练节点：8 个单位（够 8 个 bundle 各要 1）
+--resources='{"infer_node": 8}'     # 推理节点
+```
 
-后果不是"慢"：FSDP2 的 16 路分片落到错误的卡上，**NCCL 挂住 / 拓扑错乱**，
-而**没有任何东西会提示"GPU 记错了"**。
+⚠️ 为什么不用 node labels：**Ray 2.58.0 的 `ray start` 没有 `--labels` 参数**
+（`ray start --help | grep -c label` → **0**）。`.options(label_selector=...)` 语法上接受，
+但**没有 CLI 能设置它**。⇒ 现阶段可用且可移植的机制就是 `--resources`。
 
-### 3.2 起集群
-
-在 **head 节点**（建议用训练节点 0）：
+### 3.2 起 head（训练节点 0）
 
 ```bash
-# ⚠️ 显式指定网卡，避免 Ray 挑到管理网
-export RAY_GCS_SERVER_PORT=6379
-
+ray stop
 ray start --head \
   --node-ip-address=<训练节点0 的高速网 IP> \
-  --num-gpus=8 \
-  --num-cpus=$(nproc) \
+  --num-gpus=8 --num-cpus=$(nproc) \
+  --resources='{"train_node": 8}' \
   --dashboard-host=0.0.0.0
 ```
 
-在**训练节点 1**：
+### 3.3 训练节点 1
 
 ```bash
 ray start --address=<训练节点0 的 IP>:6379 \
   --node-ip-address=<训练节点1 的 IP> \
-  --num-gpus=8 \
-  --num-cpus=$(nproc)
+  --num-gpus=8 --num-cpus=$(nproc) \
+  --resources='{"train_node": 8}'
 ```
 
-在**两个推理节点**（⭐ 注意 `--num-gpus=0`）：
+### 3.4 两个推理节点（⭐ 注意是 `--num-gpus=8` + `infer_node`）
 
 ```bash
 ray start --address=<训练节点0 的 IP>:6379 \
   --node-ip-address=<本机 IP> \
-  --num-gpus=0 \
-  --num-cpus=$(nproc)
+  --num-gpus=8 --num-cpus=$(nproc) \
+  --resources='{"infer_node": 8}'
 ```
 
-> ⚠️ **`--num-gpus=0` 是本课的整个要点。** 推理节点的卡确实存在，但**不告诉 Ray**——
-> 因为那 8 张卡已经被 Dynamo 拉起的引擎占了。
->
-> 📌 `--num-cpus` 取值是个真实的设计问题：推理节点的 CPU 要同时供 SGLang 引擎
-> （tokenize / detokenize）和 `RolloutActor` 用。**给 Ray 报满会让两者抢 CPU**。
-> 具体留多少，是 S0 要实测的（本课先按 `nproc` 起，观察争抢）。
+> ⚠️ **`--num-cpus` 取值是个真问题**：推理节点的 CPU 要同时供引擎（tokenize / detokenize）
+> 和 Ray actor 用。给 Ray 报满会让两者抢 CPU。具体留多少是 S0 要实测的。
 
-### 3.3 ⚠️ 网络前提
-
-Ray 跨节点要通端口。**至少要放行**（以 `ray start` 自己打印的为准）：
-
-| 端口 | 用途 |
-| --- | --- |
-| `6379` | GCS（head 独有，**worker 要连它**） |
-| `8265` | dashboard |
-| 其余 | `ray start` 会打印实际使用的端口列表 |
-
-另外，**高速网卡必须被显式指定**，否则 Ray 的 CPU 侧通信（GLOO）可能走管理网：
-
-```bash
-export GLOO_SOCKET_IFNAME=<高速网卡>     # 与 torch 的 gloo 共用
-```
-
-参考 `Lux/docs/runbooks/multi-node-network-check.md`——那里有 IB / RoCE 的识别方法
-（`ibdev2netdev`、`NCCL_IB_HCA` 的坑）。
-
-## ④ 断言：这一步不过，后面全是错的
+## ④ 断言（这一步不过，后面全是错的）
 
 存成 `lessons/py/07_check_cluster.py` —— 📄 **可运行版本就在该文件里，⭐ 以它为准**（本文下面的代码块与它同步维护；改代码请改 `py/`，再回填这里）：
 
 ```python
-"""L07 · 多机集群断言：节点数 + GPU 账本（+ 可选：rank↔GPU 稳定性）。
+"""L07 · 把 4 个节点全部交给 Ray（32 张卡）并验证落点。
+
+⚠️ 2026-09 设计变更：**推理节点的 16 张卡也进 Ray 的账本**（旧设计是 --num-gpus=0 把它们藏起来）。
+   风险因此【反过来】：以前怕"Ray 看不见推理卡"，现在怕"Ray 把 TrainActor 放到推理卡上"。
+   ⇒ 必须用【自定义资源】给节点打角色，并把角色写进 bundle 规格。
 
 用法:
-    uv run python 07_check_cluster.py                 # 只查账本
-    uv run python 07_check_cluster.py --dump-ranks    # 另起 4 个 actor 打印 rank→(node,gpu)
+    uv run python 07_check_cluster.py                 # 查账本 + 节点角色
+    uv run python 07_check_cluster.py --check-placement   # 再验两个 PG 的落点
 """
 import os
 import sys
 import ray
 
 EXPECTED_NODES = 4
-EXPECTED_GPU = 16          # ⭐ 2 个训练节点 × 8，不是 32
+EXPECTED_GPU_TOTAL = 32          # ⭐ 训练 16 + 推理 16，全部在账本里
+TRAIN_NODES = 2
+INFER_NODES = 2
+
+TRAIN_ROLE = "train_node"        # 启动时用 --resources='{"train_node": 8}' 声明
+INFER_ROLE = "infer_node"
 
 
 @ray.remote(num_gpus=1, num_cpus=1)
-class Probe:
+class TrainProbe:
+    """假装一个训练 rank。"""
+
     def __init__(self, rank: int):
         self.rank = rank
 
-    def where(self) -> str:
-        return (f"rank={self.rank} node={ray.util.get_node_ip_address()} "
-                f"gpu={os.environ.get('CUDA_VISIBLE_DEVICES', '?')}")
+    def where(self) -> tuple[int, str, str]:
+        return (self.rank, ray.util.get_node_ip_address(),
+                os.environ.get("CUDA_VISIBLE_DEVICES", "?"))
 
 
-def dump_ranks() -> None:
-    """⭐ 用于验证 bundle 重排序是否必要：跑两次，输出必须【完全一致】。"""
-    from ray.util.placement_group import placement_group
-    from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+@ray.remote(num_gpus=2, num_cpus=2)
+class EngineProbe:
+    """假装一个 SGLang 引擎：持【2 张卡】（tp=2）。"""
 
-    n = 4
-    pg = placement_group([{"GPU": 1, "CPU": 1}] * n, strategy="STRICT_SPREAD")
-    ray.get(pg.ready())
-    actors = [
-        Probe.options(scheduling_strategy=PlacementGroupSchedulingStrategy(
-            placement_group=pg, placement_group_bundle_index=i)).remote(i)
-        for i in range(n)
-    ]
-    for line in ray.get([a.where.remote() for a in actors]):
-        print(line)
+    def __init__(self, idx: int):
+        self.idx = idx
+
+    def where(self) -> tuple[int, str, str]:
+        return (self.idx, ray.util.get_node_ip_address(),
+                os.environ.get("CUDA_VISIBLE_DEVICES", "?"))
 
 
 def main() -> int:
     ray.init(address="auto")
-
-    nodes = [n for n in ray.nodes() if n.get("Alive")]
-    print(f"存活节点数: {len(nodes)}")
-
-    total_gpu = 0.0
-    for n in sorted(nodes, key=lambda x: x["NodeManagerAddress"]):
-        res = n["Resources"]
-        gpu = res.get("GPU", 0)
-        total_gpu += gpu
-        print(f"  {n['NodeManagerAddress']:<16} CPU={res.get('CPU', 0):<8} GPU={gpu}")
-
-    print(f"\nGPU 总账: {ray.cluster_resources().get('GPU', 0)}")
-    print(f"CPU 总账: {ray.cluster_resources().get('CPU', 0)}")
-
     ok = True
+
+    # ── ① 账本 ────────────────────────────────────────────────────
+    nodes = [n for n in ray.nodes() if n.get("Alive")]
+    print(f"存活节点数: {len(nodes)}  (期望 {EXPECTED_NODES})\n")
+
+    total_gpu = 0
+    train_seen = infer_seen = 0
+    for n in sorted(nodes, key=lambda x: x["NodeManagerAddress"]):
+        r = n["Resources"]
+        gpu = int(r.get("GPU", 0))
+        total_gpu += gpu
+        role = ("训练" if r.get(TRAIN_ROLE) else
+                "推理" if r.get(INFER_ROLE) else
+                "⚠️ 无角色资源")
+        if r.get(TRAIN_ROLE):
+            train_seen += 1
+        if r.get(INFER_ROLE):
+            infer_seen += 1
+        print(f"  {n['NodeManagerAddress']:<16} GPU={gpu:<3} CPU={int(r.get('CPU', 0)):<5} "
+              f"{role}")
+
+    print(f"\nGPU 总账: {ray.cluster_resources().get('GPU', 0)}  (期望 {EXPECTED_GPU_TOTAL})")
+    print(f"训练节点 {train_seen} 个 / 推理节点 {infer_seen} 个"
+          f"  (期望 {TRAIN_NODES} / {INFER_NODES})")
+
     if len(nodes) != EXPECTED_NODES:
-        print(f"❌ 节点数 {len(nodes)} != {EXPECTED_NODES}")
+        print(f"❌ 节点数 {len(nodes)} != {EXPECTED_NODES}"); ok = False
+    if total_gpu != EXPECTED_GPU_TOTAL:
+        print(f"❌ GPU 总账 {total_gpu} != {EXPECTED_GPU_TOTAL}"
+              f"{'（推理节点漏了 --num-gpus=8？）' if total_gpu < EXPECTED_GPU_TOTAL else ''}")
         ok = False
-    if total_gpu != EXPECTED_GPU:
-        hint = ("（很可能是推理节点带着卡 join 了 —— 检查 --num-gpus=0）"
-                if total_gpu > EXPECTED_GPU else "")
-        print(f"❌ GPU 账本 {total_gpu} != {EXPECTED_GPU}{hint}")
+    if train_seen != TRAIN_NODES or infer_seen != INFER_NODES:
+        print(f"❌ 节点角色不对：说明有节点启动时没写 --resources"
+              f"，**落点约束会失效**（Ray 可能把训练放到推理节点）")
         ok = False
-    print("\n✅ 集群账本正确" if ok else "\n❌ 账本不对，先修它再往下走")
 
-    if "--dump-ranks" in sys.argv:
-        print("\n--- rank ↔ (node, gpu) ---")
-        dump_ranks()
+    # ── ② 落点：两个 PG，bundle 里带角色资源 ──────────────────────
+    if "--check-placement" in sys.argv:
+        from ray.util.placement_group import placement_group
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
+        print("\n--- 落点验证 ---")
+        train_pg = placement_group(
+            [{"GPU": 1, "CPU": 1, TRAIN_ROLE: 1}] * 16, strategy="PACK")
+        eng_pg = placement_group(
+            [{"GPU": 2, "CPU": 2, INFER_ROLE: 1}] * 8, strategy="PACK")
+        try:
+            ray.get([train_pg.ready(), eng_pg.ready()], timeout=30)
+        except ray.exceptions.GetTimeoutError:
+            print("❌ PG 没 ready —— 角色资源数量对不上（bundle 规格 vs --resources 的量）")
+            ray.shutdown()
+            return 1
+
+        def sched(pg, i):
+            return PlacementGroupSchedulingStrategy(
+                placement_group=pg, placement_group_bundle_index=i)
+
+        trains = [TrainProbe.options(scheduling_strategy=sched(train_pg, i)).remote(i)
+                  for i in range(16)]
+        engines = [EngineProbe.options(scheduling_strategy=sched(eng_pg, i)).remote(i)
+                   for i in range(8)]
+
+        train_ips = {w[1] for w in ray.get([t.where.remote() for t in trains])}
+        eng_ips = {w[1] for w in ray.get([e.where.remote() for e in engines])}
+        train_gpus = {w[2] for w in ray.get([t.where.remote() for t in trains])}
+        eng_gpus = {w[2] for w in ray.get([e.where.remote() for e in engines])}
+
+        print(f"  16 个 TrainActor 落在 {len(train_ips)} 个节点上: {sorted(train_ips)}")
+        print(f"   它们的 CVD: {sorted(train_gpus)}")
+        print(f"  8 个 EngineActor 落在 {len(eng_ips)} 个节点上: {sorted(eng_ips)}")
+        print(f"   它们的 CVD: {sorted(eng_gpus)}   ← 引擎持 2 张卡，CVD 应是【两个号】")
+
+        both = train_ips & eng_ips
+        if both:
+            print(f"❌ 这些节点上【同时】有训练和引擎: {sorted(both)}")
+            print("   ⇒ bundle 里的角色资源没起作用，检查 --resources 的量是否够")
+            ok = False
+        else:
+            print("  ✅ 训练与推理完全分离，没有节点同时承载两者")
+
+    print("\n" + ("✅ 集群与落点都正确" if ok else "❌ 有问题，先修再往下"))
     ray.shutdown()
     return 0 if ok else 1
 
@@ -189,95 +222,89 @@ uv run python lessons/py/07_check_cluster.py
 期望输出：
 
 ```
-存活节点数: 4
-  10.0.0.11        CPU=128.0  GPU=8.0
-  10.0.0.12        CPU=128.0  GPU=8.0
-  10.0.0.21        CPU=128.0  GPU=0.0      ← 推理节点，0 卡
-  10.0.0.22        CPU=128.0  GPU=0.0      ← 推理节点，0 卡
+存活节点数: 4  (期望 4)
 
-GPU 总账: 16.0
-CPU 总账: 512.0
+  10.0.0.11        GPU=8   CPU=128  训练
+  10.0.0.12        GPU=8   CPU=128  训练
+  10.0.0.21        GPU=8   CPU=128  推理
+  10.0.0.22        GPU=8   CPU=128  推理
 
-✅ 集群账本正确
+GPU 总账: 32.0  (期望 32)
+训练节点 2 个 / 推理节点 2 个  (期望 2 / 2)
+
+✅ 集群与落点都正确
 ```
 
-也可以直接用 CLI 看：
+## ⑤ 落点验证：两个 PG，bundle 规格里带角色
 
 ```bash
-ray status
-# Resources 一节里应出现： GPU: 16.0/16.0
+uv run python lessons/py/07_check_cluster.py --check-placement
 ```
 
-## ⑤ 跨节点验证：PG 真的把人放到不同节点了吗
-
-这是 [L03](03-placement-group.md) 在单机上**看不到**的部分。把 `TrainActor` 放到
-`10.0.0.11` / `10.0.0.12` 两台机器上：
+脚本会建**两个** PG，**bundle 里带上角色资源**：
 
 ```python
-# 4 个 actor，STRICT_SPREAD：强制分到不同节点
-pg = placement_group([{"GPU": 1, "CPU": 1}] * 4, strategy="STRICT_SPREAD")
-ray.get(pg.ready())
-
-actors = [
-    A.options(scheduling_strategy=PlacementGroupSchedulingStrategy(
-        placement_group=pg, placement_group_bundle_index=i)).remote(i)
-    for i in range(4)
-]
-for info in ray.get([a.where.remote() for a in actors]):
-    print(info["rank"], info["node_ip"])
+train_pg = placement_group([{"GPU": 1, "CPU": 1, "train_node": 1}] * 16)
+eng_pg   = placement_group([{"GPU": 2, "CPU": 2, "infer_node": 1}] * 8)
 ```
 
-**应看到 4 个 actor 分布在 2 台训练节点上**（`STRICT_SPREAD` 会尽量打散）。
+⭐ **为什么这样就够了**：PG 的 bundle **只能被满足它的节点满足**。带 `train_node: 1` 的
+bundle 落不到推理节点上（那里没有这个资源）——**约束是资源系统强制的，不是靠自觉**。
 
-⚠️ 若 4 个全落在同一台 —— 说明 PG 的 bundle 定义里没写 `GPU`（只有 CPU 时 Ray 可能都塞一处）。
-**这正是"bundle 里写什么资源，决定了它能被放在哪"**。
+期望输出：
 
-### ⭐ 然后验 bundle 重排序（Lux 的正确性依赖）
-
-跑**两次**同样的绑定，把 `rank → (node_ip, gpu_id)` 记下来：
-
-```bash
-uv run python lessons/py/07_check_cluster.py --dump-ranks > run1.txt
-uv run python lessons/py/07_check_cluster.py --dump-ranks > run2.txt
-diff run1.txt run2.txt && echo "✅ rank↔GPU 映射稳定"
 ```
+  16 个 TrainActor 落在 2 个节点上: ['10.0.0.11', '10.0.0.12']
+   它们的 CVD: ['0', '1', '2', '3', '4', '5', '6', '7']
+  8 个 EngineActor 落在 2 个节点上: ['10.0.0.21', '10.0.0.22']
+   它们的 CVD: ['0,1', '2,3', '4,5', '6,7']   ← 引擎持 2 张卡，CVD 是【两个号】
 
-**两次必须完全一致**。若不一致，就必须做 slime 那套 **bundle 重排序**
-（`third_party/slime/slime/ray/placement_group.py`，253 行）。
+  ✅ 训练与推理完全分离，没有节点同时承载两者
+```
 
 ## ⑥ 排错表
 
 | 现象 | 原因 |
 | --- | --- |
-| worker 卡在 `ray start --address` 不动 | head 的 `6379` 被防火墙挡了；或 `--node-ip-address` 写成了 `127.0.0.1` |
-| `ray status` 里 GPU = 32 | ⭐ 推理节点忘了 `--num-gpus=0` |
-| `ray status` 里 GPU = 0 | 训练节点没写 `--num-gpus=8`（Ray 有时探测不到） |
-| 节点的 IP 全是 `127.0.0.1` | `--node-ip-address` 没指定，Ray 挑错了网卡 |
-| 多机 gloo 通信超时 | `GLOO_SOCKET_IFNAME` 没设，走了管理网 |
-| actor 起不来且不报错 | PG 没 ready（[L03](03-placement-group.md) 的 gang 语义）——先 `ray.get(pg.ready())` |
+| `GPU 总账 = 16` | 推理节点漏了 `--num-gpus=8`（旧设计才是 0，**新设计要 8**） |
+| `⚠️ 无角色资源` | 该节点 `ray start` 时没写 `--resources` ⇒ **落点约束整体失效** |
+| `PG 没 ready` | bundle 要的角色资源数量 > 节点声明的量（如 16 个 bundle 各要 1，但只声明了 8） |
+| **训练和引擎落在同一节点** | ⭐ 最危险：bundle 里没写角色资源，或节点漏了 `--resources`。**这是静默的**——不会报错 |
+| worker 连不上 head | 6379 被防火墙挡了，或 `--node-ip-address` 写成了 `127.0.0.1` |
+| 多机 gloo/NCCL 超时 | `GLOO_SOCKET_IFNAME` / `NCCL_SOCKET_IFNAME` 没设，走了管理网 |
 
-**收工**（每个节点都要跑）：
-
-```bash
-ray stop
-```
+**收工**（每个节点）：`ray stop`
 
 ## ⑦ 为什么 Lux 关心这个
 
-本课的可交付物**就是** Lux S0 的**阶段 0.1**（`Lux/docs/runbooks/s0-verification.md`）：
+### ① 这一课 = Lux S0 的**阶段 0.1**
 
-| 步 | 做什么 | 通过条件 |
-| ---: | --- | --- |
-| **0.1** | 起 Ray，4 个节点全部 join | `ray status` 看得到 **4 个节点**；且 **`Resources` 里的 GPU 总数必须是 16，不是 32** |
+但**通过条件变了**（因为设计变了）：
 
-而它**在今天之前是漏掉的**——`s0-verification.md` 原先的阶段 0 里**完全没有"起 Ray"这一步**
-（`grep -i ray` 零命中），但阶段 1 之后的每一个验证都依赖 Ray actor。
+| | 旧 | **新** |
+| --- | --- | --- |
+| 节点数 | 4 | 4 |
+| **GPU 总账** | **16**（推理侧不进账本） | ⭐ **32**（全部进账本） |
+| 新增断言 | — | ⭐ **没有任何节点同时承载训练与引擎** |
 
-⇒ **跑通本课 = S0 阶段 0.1 完成**，而且是带着一个**可执行的断言**完成的，
-不是"看起来起来了"。
+⚠️ **新增的那条才是新设计下真正的风险**。旧设计里"Ray 把训练放到推理节点"是**不可能**的
+（它看不见那些卡）；新设计里它**变得可能**，而且**不报错**——你只会看到训练莫名其妙变慢，
+或者引擎 OOM。
+
+⇒ **风险从"账本少报了"变成"落点没约束"。两者都是静默的，但后者只能靠显式机制防。**
+
+### ② 这个变更连锁影响的东西（只列，不在本课展开）
+
+| 项 | 变化 |
+| --- | --- |
+| SGLang 引擎 | 从"Dynamo 自己拉起的普通进程" → **Ray actor 持卡 + 引擎作子进程**（→ [L10](10-engine-actor.md)） |
+| ADR-0003 的一条收益 | 「Dynamo 自己拉起」不再是收益，要改写 |
+| S0 必验 #17 | 断言从「GPU = 16，不是 32」**反过来**变成「GPU = 32，且落点分离」 |
+| `--num-gpus=0` | ❌ **整个手段作废** |
 
 ## ⑧ 一句话总结
 
-> **Ray 的资源账本是你声明的，不是它探测的。**
-> 在一个"有些卡被别的系统占着"的集群上，**必须主动把那些卡从账本里去掉**（`--num-gpus=0`），
-> 否则 Ray 会把训练任务调度到已经跑着推理引擎的卡上——**而且不报错**。
+> **Ray 的账本是声明式的**：你不声明的它当不存在，你声明的它就会往上调度。
+> 旧设计用"少报"来防止误调度；**新设计把卡全部交给 Ray，代价是必须自己加约束**
+> —— 用**自定义资源写进 bundle 规格**，让资源系统去强制它。
+

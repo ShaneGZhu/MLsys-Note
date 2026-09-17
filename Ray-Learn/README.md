@@ -130,9 +130,10 @@ ray.init(resources={"fake_gpu": 4})
 | [L04](lessons/04-named-actor.md) | 具名 actor、namespace、**死掉以后什么样** | `name=` / `namespace=` / `get_actor` / `ray.kill` | `LuxDriver`、故障恢复 | 单卡即可 | 必做 |
 | [L05](lessons/05-sync-vs-async.md) | **饿死实验**：为什么阻塞一个 actor 会拖死全部 | `max_concurrency` / async actor | ⭐ **`rollout` 为什么必须独立** | **无需 GPU** | ⭐⭐ 最重要 |
 | [L06](lessons/06-rendezvous.md) | 手工 rendezvous + **NCCL** 进程组 | `get_node_ip_address` + `init_process_group` + `NCCL_DEBUG` | 16 个 `TrainActor` 组成 PG | 1 台 × 8 卡 | 必做 |
-| [L07](lessons/07-multinode.md) | 多机集群：`ray start`、`--num-gpus`、GLOO | `ray start --head/--address` / `ray status` | **S0 阶段 0.1** | **4 台** | 上机时做 |
+| [L07](lessons/07-multinode.md) | ⭐ **4 节点 32 卡全交给 Ray** + **用自定义资源做落点约束** | `ray start --resources` / 角色 bundle 规格 | **S0 阶段 0.1** | **4 台** | 上机时做 |
 | [L08](lessons/08-gpu-identity.md) | ⭐ **`ray.get_gpu_ids()`** + `InfoActor` 探测 + **bundle 重排序** | `ray.get_gpu_ids` / `PlacementGroup` 探测 | 「rank↔GPU 稳定」的**实现手段** | 1 台 × 8 卡 | ⭐ 必做（补 L03 的另一半） |
 | [L09](lessons/09-env-and-lock.md) | ⭐ **环境变量注入**（3 条必须照抄）+ 24 行分布式锁 | `runtime_env` / `@ray.remote class Lock` | `config.py` 启动期；版本屏障 | 任意机器 | ⭐ 必做 |
+| [L10](lessons/10-engine-actor.md) | ⭐⭐ **引擎即 actor**：actor 持 2 张卡 + 引擎作**子进程** | `num_gpus=2` + `subprocess` + CVD 继承 | 推理侧 16 张卡的**持有者**；权重更新链路的前提 | 1 台 × 8 卡 | ⭐⭐ 必做 |
 
 **顺序不能换**：L02 是 L03 的前提，L04 是 L05 的前提，L06 是 L07 的前提，**L03 是 L08 的前提**。
 
